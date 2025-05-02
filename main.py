@@ -49,7 +49,7 @@ app.add_middleware(
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- 서버2 URL (회의 정보 포함하여 POST하도록 수정) ---
-SERVER2_URL = "http://localhost:8000/chunk-summarize-search"  #  vector_team5  (API2)
+SERVER2_URL = "http://192.168.1.244:8001/chunk-summarize-search"  #  vector_team5  (API2)
 INSIGHT_URL = "http://localhost:8775/analyze"                 #  insite        (API3)
 
 @app.post("/upload-audio")
