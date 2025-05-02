@@ -49,7 +49,8 @@ app.add_middleware(
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # --- 서버2 URL (회의 정보 포함하여 POST하도록 수정) ---
-SERVER2_URL = "http://192.168.1.244:8001/chunk-summarize-search"
+SERVER2_URL = "http://localhost:8000/chunk-summarize-search"  #  vector_team5  (API2)
+INSIGHT_URL = "http://localhost:8775/analyze"                 #  insite        (API3)
 
 @app.post("/upload-audio")
 async def upload_audio(file: UploadFile = File(...), meeting_info: str = Form(...)):
@@ -99,13 +100,32 @@ async def upload_audio(file: UploadFile = File(...), meeting_info: str = Form(..
         try:
             response_server2 = requests.post(
                 SERVER2_URL,
-                json={"text": full_text, "meeting_info": meeting_info},
-                timeout=10
+                json={"text": full_text, "meeting_info": meeting_info}
+                
             )
             response_server2.raise_for_status()
             server2_result = response_server2.json()
-            logger.info(f"[{request_id}] Server2 response: {server2_result}")
-            return {"message": "STT 변환 및 서버2로 전송 완료", "server2_result": server2_result, "stt_text": full_text}
+            # ---- API3 : 핵심 인사이트 추출 ----
+            try:
+                insight_resp = requests.post(
+                    INSIGHT_URL,
+                    json={"text": full_text}
+                      
+                )
+                insight_resp.raise_for_status()
+                insights = insight_resp.json()
+            except requests.exceptions.Timeout:
+                logger.error(f"[{request_id}] Insight API timeout")
+                insights = {"error": "Insight API timeout"}
+            except requests.exceptions.RequestException as e:
+                logger.error(f"[{request_id}] Insight API error: {e}")
+                insights = {"error": str(e)}
+            return {
+                "message": "STT 변환·문서 검색·인사이트 추출 완료",
+                "stt_text": full_text,
+                "documents": server2_result,
+                "insights": insights
+            }
         except requests.exceptions.RequestException as e:
             logger.error(f"[{request_id}] Error sending data to Server2: {e}")
             return {"error": f"서버2 요청 실패: {e}", "stt_text": full_text}
