@@ -1,5 +1,5 @@
-# 1. CUDA 런타임이 포함된 베이스 이미지 (Ubuntu 22.04 + CUDA 12.3)
-FROM nvidia/cuda:12.3.2-runtime-ubuntu22.04
+# 1. CUDA 런타임이 포함된 베이스 이미지
+FROM nvidia/cuda:12.6.0-cudnn8-runtime-ubuntu22.04
 
 # 2. 파이썬 캐시 비활성화 및 비버퍼 출력
 ENV PYTHONDONTWRITEBYTECODE=1
