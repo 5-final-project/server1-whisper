@@ -84,7 +84,7 @@ async def upload_audio(file: UploadFile = File(...), meeting_info: str = Form(..
     stt_input_path = converted_wav_path
     logger.info(f"[{request_id}] Starting transcription for '{stt_input_path}'...")
     start_time = time.time()
-    segments, info = model.transcribe(stt_input_path, language="ko", beam_size=5, vad_filter=True)
+    segments, info = model.transcribe(stt_input_path, language="None", beam_size=5, vad_filter=True)
     end_time = time.time()
     processing_time = end_time - start_time
     full_text = "\n".join([segment.text.strip() for segment in segments])
