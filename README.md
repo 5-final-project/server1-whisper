@@ -78,11 +78,13 @@ docker run --gpus all -p 8000:8000 whisper-stt-server
 
 **예제**:
 ```bash
-curl -X POST "http://localhost:8000/upload-audio" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@/path/to/audio.mp3" \
-  -F "meeting_info=회의 테스트" \
-  -F "language=ko"
+curl -X 'POST' \
+  'http://cuvtgv0ku7.ap.loclx.io/upload-audio' \
+  -H 'accept: application/json' \
+  -H 'Content-Type: multipart/form-data' \
+  -F 'file=@LLM 설명 (요약버전) [HnvitMTkXro].mp3;type=audio/mpeg' \
+  -F 'meeting_info=test' \
+  -F 'language=ko'
 ```
 
 ### 클라이언트 사용법 (stt_client.py)
