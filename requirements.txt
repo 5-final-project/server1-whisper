@@ -1,7 +1,11 @@
-fastapi
-uvicorn
-requests
-faster-whisper
-torch
-python-multipart
-ffmpeg-python
+fastapi==0.109.0
+uvicorn==0.27.0
+requests==2.31.0
+faster-whisper==0.10.0
+torch>=2.0.0
+python-multipart==0.0.6
+ffmpeg-python==0.2.0
+
+# 배치 처리 및 추가 기능을 위한 패키지
+numpy>=1.25.0
+tqdm>=4.66.0

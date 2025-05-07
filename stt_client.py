@@ -35,6 +35,11 @@ def main() -> None:
         help="회의 정보(제목·날짜 등) 텍스트",
     )
     parser.add_argument(
+        "--language",
+        default="ko",
+        help="변환할 언어 코드 (예: ko, en, ja 등). 미지정시 자동 감지",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=600,
@@ -60,7 +65,10 @@ def main() -> None:
                     "audio/wav",
                 )
             }
+            # 요청 데이터에 language 옵션 추가 (있는 경우만)
             data = {"meeting_info": args.meeting_info}
+            if args.language:
+                data["language"] = args.language
 
             print(
                 f"'{args.audio_file}' 전송 → {args.server_url} (timeout={args.timeout}s)"
