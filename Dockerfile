@@ -1,5 +1,5 @@
-# 1. CUDA 11.8 베이스 이미지 사용 (PyTorch 호환성을 위해 CUDA 11.8 선택)
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# 1. CUDA 12.6 베이스 이미지 
+FROM nvidia/cuda:12.6.2-cudnn-runtime-ubuntu22.04
 
 # 2. 환경 변수 설정
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -38,5 +38,5 @@ RUN mkdir -p /app/models /app/temp_audio
 # 9. 애플리케이션 코드 복사
 COPY . .
 
-# 10. FastAPI 서버 실행 (포트 8001 사용)
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+# 10. FastAPI 서버 실행
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8666"]
