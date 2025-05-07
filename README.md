@@ -28,23 +28,10 @@ Faster-Whisper의 BatchedInferencePipeline을 사용해 긴 오디오 파일도 
 - Python 3.8 이상
 - CPU 실행 가능 (GPU 사용 가능 시 기본적으로 GPU 사용)
 - Docker 환경 지원
-- CUDA 11.8 지원 (선택사항 - GPU 사용 시)
+- CUDA 12.6 지원 (선택사항 - GPU 사용 시)
 - FFmpeg (오디오 전처리용)
 - 최소 4GB RAM, 권장 8GB 이상
 
-### 의존성
-
-```
-fastapi==0.109.0
-uvicorn==0.27.0
-requests==2.31.0
-faster-whisper==0.10.0
-torch>=2.0.0
-python-multipart==0.0.6
-ffmpeg-python==0.2.0
-numpy>=1.25.0
-tqdm>=4.66.0
-```
 
 ## 설치 및 실행 방법
 
