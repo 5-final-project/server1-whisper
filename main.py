@@ -121,7 +121,6 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 async def upload_audio(file: UploadFile = File(...), meeting_info: str = Form(...), language: str = Form(None)):
   """
   오디오 파일을 STT로 변환하여 전체 텍스트를 JSON 으로 반환합니다.
-  • Hub(WebSocket 서버)가 후속 API2/3/4를 호출합니다.
   """
   if model is None:
     raise HTTPException(status_code=503, detail="Model is not available")
