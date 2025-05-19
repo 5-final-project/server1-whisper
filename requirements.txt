@@ -10,3 +10,6 @@ ffmpeg-python==0.2.0
 numpy>=1.25.0
 tqdm>=4.66.0
 hf_xet
+
+#로그
+python-json-logger
