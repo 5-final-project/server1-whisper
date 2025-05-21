@@ -20,16 +20,20 @@ pipeline {
     stage('Deploy Container') {
       steps {
         sh '''
-if docker ps -a --format '{{.Names}}' | grep -x "${IMAGE_NAME}" > /dev/null 2>&1; then
-  echo "Stopping existing container ${IMAGE_NAME}"
-  docker rm -f ${IMAGE_NAME}
-fi
-docker run -d \
-  --name ${IMAGE_NAME} \
-  -p 8001:8666 \
-  -v /mnt/d/team5/server1-whisper:/app/data \
-  ${IMAGE_NAME}:${IMAGE_TAG}
-'''
+          # Check if a container with this name exists (exact match)
+          existing=$(docker ps -a --filter "name=^/${IMAGE_NAME}$" --format "{{.Names}}")
+          if [ "$existing" = "${IMAGE_NAME}" ]; then
+            echo "Stopping and removing existing container ${IMAGE_NAME}"
+            docker rm -f "${IMAGE_NAME}"
+          fi
+
+          # Run new container
+          docker run -d \
+            --name "${IMAGE_NAME}" \
+            -p 8001:8666 \
+            -v /mnt/d/team5/server1-whisper:/app/data \
+            "${IMAGE_NAME}:${IMAGE_TAG}"
+        '''
       }
     }
     stage('Cleanup') {
