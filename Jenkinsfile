@@ -13,7 +13,6 @@ pipeline {
       }
     }
     stage('Build Docker Image') {
-      agent { label 'docker-builder' }
       steps {
         sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .'
       }
