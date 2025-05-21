@@ -1,5 +1,5 @@
 pipeline {
-  agent any
+  agent { label 'docker-builder' }
 
   environment {
     IMAGE_NAME = "whisper-stt-server"
