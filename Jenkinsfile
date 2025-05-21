@@ -1,10 +1,5 @@
 pipeline {
-  agent {
-    docker {
-      image 'docker:24.0.2'
-      args '-v /var/run/docker.sock:/var/run/docker.sock'
-    }
-  }
+  agent any
 
   environment {
     IMAGE_NAME = "whisper-stt-server"
@@ -19,21 +14,23 @@ pipeline {
     }
     stage('Build Docker Image') {
       steps {
-        sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .'
+        script {
+          def built = docker.build("${IMAGE_NAME}:${IMAGE_TAG}")
+        }
       }
     }
     stage('Deploy Container') {
       steps {
-        sh '''
-          if docker ps -a --format "{{.Names}}" | grep -q "^${IMAGE_NAME}$"; then
-            docker stop ${IMAGE_NAME} && docker rm ${IMAGE_NAME}
-          fi
-          docker run -d \
-            --name ${IMAGE_NAME} \
-            -p 8666:8666 \
-            -v /mnt/d/team5/server1-whisper:/app/data \
-            ${IMAGE_NAME}:${IMAGE_TAG}
-        '''
+        script {
+          if (docker.image("${IMAGE_NAME}:${IMAGE_TAG}").exists()) {
+            sh """
+              if docker ps -a --format "{{.Names}}" | grep -q "^${IMAGE_NAME}$"; then
+                docker stop ${IMAGE_NAME} && docker rm ${IMAGE_NAME}
+              fi
+            """
+          }
+          docker.image("${IMAGE_NAME}:${IMAGE_TAG}").run("-d --name ${IMAGE_NAME} -p 8666:8666 -v /mnt/d/team5/server1-whisper:/app/data")
+        }
       }
     }
     stage('Cleanup') {
