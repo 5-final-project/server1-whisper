@@ -14,23 +14,21 @@ pipeline {
     }
     stage('Build Docker Image') {
       steps {
-        script {
-          docker.build("${IMAGE_NAME}:${IMAGE_TAG}")
-        }
+        sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .'
       }
     }
     stage('Deploy Container') {
       steps {
-        script {
-          // Stop and remove any existing container
-          sh '''
-            if docker ps -a --format "{{.Names}}" | grep -q "^${IMAGE_NAME}$"; then
-              docker stop ${IMAGE_NAME} && docker rm ${IMAGE_NAME}
-            fi
-          '''
-          // Run new container
-          sh "docker run -d --name ${IMAGE_NAME} -p 8666:8666 ${IMAGE_NAME}:${IMAGE_TAG}"
-        }
+        sh '''
+          if docker ps -a --format "{{.Names}}" | grep -q "^${IMAGE_NAME}$"; then
+            docker stop ${IMAGE_NAME} && docker rm ${IMAGE_NAME}
+          fi
+          docker run -d \
+            --name ${IMAGE_NAME} \
+            -p 8666:8666 \
+            -v /mnt/d/team5/server1-whisper:/app/data \
+            ${IMAGE_NAME}:${IMAGE_TAG}
+        '''
       }
     }
     stage('Cleanup') {
