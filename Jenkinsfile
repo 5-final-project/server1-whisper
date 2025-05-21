@@ -19,12 +19,13 @@ pipeline {
     }
     stage('Deploy Container') {
       steps {
-        sh '''
-          if docker ps -a --format "{{.Names}}" | grep -q "^$IMAGE_NAME\\$"; then
-            docker stop $IMAGE_NAME && docker rm $IMAGE_NAME
+        sh """
+          if docker ps -a --format "{{.Names}}" | grep -q "^${IMAGE_NAME}\$"; then
+            docker stop ${IMAGE_NAME}
+            docker rm ${IMAGE_NAME}
           fi
-          docker run -d --name $IMAGE_NAME -p 8001:8666 -v /mnt/d/team5/server1-whisper:/app/data $IMAGE_NAME:$IMAGE_TAG
-        '''
+          docker run -d --name ${IMAGE_NAME} -p 8001:8666 -v /mnt/d/team5/server1-whisper:/app/data ${IMAGE_NAME}:${IMAGE_TAG}
+        """
       }
     }
     stage('Cleanup') {
