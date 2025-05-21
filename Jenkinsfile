@@ -24,7 +24,7 @@ pipeline {
         script {
           if (docker.image("${IMAGE_NAME}:${IMAGE_TAG}").exists()) {
             sh """
-              if docker ps -a --format "{{.Names}}" | grep -q "^${IMAGE_NAME}$"; then
+              if docker ps -a --format "{{.Names}}" | grep -q "^${IMAGE_NAME}\\$"; then
                 docker stop ${IMAGE_NAME} && docker rm ${IMAGE_NAME}
               fi
             """
