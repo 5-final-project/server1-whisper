@@ -19,7 +19,7 @@ pipeline {
     }
     stage('Deploy Container') {
       steps {
-        sh """
+        sh '''
 if docker ps -a --format '{{.Names}}' | grep -x "${IMAGE_NAME}" > /dev/null 2>&1; then
   echo "Stopping existing container ${IMAGE_NAME}"
   docker rm -f ${IMAGE_NAME}
@@ -29,7 +29,7 @@ docker run -d \
   -p 8001:8666 \
   -v /mnt/d/team5/server1-whisper:/app/data \
   ${IMAGE_NAME}:${IMAGE_TAG}
-"""
+'''
       }
     }
     stage('Cleanup') {
