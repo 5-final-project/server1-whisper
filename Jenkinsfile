@@ -1,5 +1,5 @@
 pipeline {
-  agent any
+  agent { label 'team5' }
 
   environment {
     IMAGE_NAME = "whisper-stt-server"
