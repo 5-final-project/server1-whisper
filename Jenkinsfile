@@ -20,6 +20,12 @@ pipeline {
     stage('Deploy Container') {
       steps {
         sh '''
+          # Ensure legacy container "server1-whisper" is removed
+          if docker ps -a --filter "name=^/server1-whisper$" --format "{{.Names}}" | grep -q "^server1-whisper$"; then
+            echo "Stopping and removing legacy container server1-whisper"
+            docker rm -f server1-whisper
+          fi
+
           # Check if a container with this name exists (exact match)
           existing=$(docker ps -a --filter "name=^/${IMAGE_NAME}$" --format "{{.Names}}")
           if [ "$existing" = "${IMAGE_NAME}" ]; then
