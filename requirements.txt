@@ -19,4 +19,4 @@ prometheus-fastapi-instrumentator
 
 # GPU 모니터링 및 직접 메트릭 생성을 위한 패키지
 prometheus_client>=0.20.0
-nvidia-ml-py3>=12.535.161
+nvidia-ml-py3  # 최신 사용 가능한 버전 자동 설치
