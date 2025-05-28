@@ -13,6 +13,16 @@ import wave
 import math
 from pythonjsonlogger import jsonlogger # 추가
 
+# 기존 코드 맨 위에 추가
+import pynvml
+from prometheus_client import Gauge, Counter, Histogram
+
+# GPU 메트릭 정의
+team5_gpu_utilization = Gauge('team5_gpu_utilization_percent', 'Team5 GPU utilization', ['service'])
+team5_gpu_memory_used = Gauge('team5_gpu_memory_used_mb', 'Team5 GPU memory used', ['service'])
+team5_stt_requests = Counter('team5_stt_requests_total', 'Total STT requests', ['service'])
+team5_stt_duration = Histogram('team5_stt_processing_seconds', 'STT processing time', ['service'])
+
 # --- FastAPI 앱 생성 및 CORS 설정 ---
 app = FastAPI(
     title="Whisper STT API Server",
@@ -27,6 +37,37 @@ from fastapi.exception_handlers import RequestValidationError
 from fastapi.exceptions import RequestValidationError as FastAPIRequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
+
+# GPU 모니터링 미들웨어 수정 (더 안전하게)
+@app.middleware("http")
+async def gpu_monitoring_middleware(request: Request, call_next):
+    if request.url.path == "/upload-audio":
+        try:
+            # GPU 상태 측정 시작
+            pynvml.nvmlInit()
+            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            
+            start_time = time.time()
+            response = await call_next(request)
+            processing_time = time.time() - start_time
+            
+            # 처리 후 상태
+            util_after = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            mem_after = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            
+            # 메트릭 업데이트
+            team5_gpu_utilization.labels(service='whisper-stt').set(util_after.gpu)
+            team5_gpu_memory_used.labels(service='whisper-stt').set(mem_after.used / 1024 / 1024)
+            team5_stt_requests.labels(service='whisper-stt').inc()
+            team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
+            
+            return response
+        except Exception as e:
+            # GPU 모니터링 실패해도 API는 정상 동작하도록
+            logger.warning(f"GPU monitoring failed: {e}")
+            return await call_next(request)
+    else:
+        return await call_next(request)
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error({

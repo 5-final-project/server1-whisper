@@ -12,11 +12,13 @@ pipeline {
         checkout scm
       }
     }
+    
     stage('Build Docker Image') {
       steps {
         sh "docker build -t ${IMAGE_NAME}:${IMAGE_TAG} ."
       }
     }
+    
     stage('Deploy Container') {
       steps {
         sh '''
@@ -33,16 +35,20 @@ pipeline {
             docker rm -f "${IMAGE_NAME}"
           fi
 
-          # Run new container
+          # Run new container with GPU support and Team5 network
           docker run -d \
             --name "${IMAGE_NAME}" \
-            -p 8001:8666 \
+            --runtime=nvidia \
+            --gpus all \
+            --network team5-net \
+            -p 8002:8666 \
             -v /mnt/d/team5/server1-whisper:/app/data \
             -v /mnt/d/team5/server1-whisper/logs:/app/logs \
             "${IMAGE_NAME}:${IMAGE_TAG}"
         '''
       }
     }
+    
     stage('Cleanup') {
       steps {
         script {

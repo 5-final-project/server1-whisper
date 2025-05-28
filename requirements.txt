@@ -17,5 +17,6 @@ python-json-logger
 # Prometheus metrics (Instrumentator 버전이 기본)
 prometheus-fastapi-instrumentator
 
-# (만약 직접 Gauge 등 쓰는 경우만) 아래도 추가
-# prometheus_client
+# GPU 모니터링 및 직접 메트릭 생성을 위한 패키지
+prometheus_client>=0.20.0
+nvidia-ml-py3>=12.535.161
