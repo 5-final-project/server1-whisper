@@ -11,5 +11,11 @@ numpy>=1.25.0
 tqdm>=4.66.0
 hf_xet
 
-#로그
+# 로그
 python-json-logger
+
+# Prometheus metrics (Instrumentator 버전이 기본)
+prometheus-fastapi-instrumentator
+
+# (만약 직접 Gauge 등 쓰는 경우만) 아래도 추가
+# prometheus_client

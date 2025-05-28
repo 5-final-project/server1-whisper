@@ -285,3 +285,6 @@ async def read_root():
     Root health check.
     """
     return {"message": "Whisper STT API Server with BatchedInferencePipeline is running"}
+
+from prometheus_fastapi_instrumentator import Instrumentator
+Instrumentator().instrument(app).expose(app)
