@@ -38,36 +38,62 @@ from fastapi.exceptions import RequestValidationError as FastAPIRequestValidatio
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
-# GPU 모니터링 미들웨어 수정 (더 안전하게)
+# 더 안정적인 GPU 모니터링 미들웨어
 @app.middleware("http")
 async def gpu_monitoring_middleware(request: Request, call_next):
     if request.url.path == "/upload-audio":
+        start_time = time.time()
+        response = await call_next(request)  # 먼저 응답 처리
+        processing_time = time.time() - start_time
+        
+        # GPU 모니터링은 응답 처리 후에 안전하게 수행
         try:
-            # GPU 상태 측정 시작
+            gpu_metrics = get_gpu_metrics_with_retry(max_retries=3)
+            if gpu_metrics:
+                team5_gpu_utilization.labels(service='whisper-stt').set(gpu_metrics['utilization'])
+                team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_metrics['memory_used'])
+        except Exception as e:
+            # GPU 모니터링 실패해도 로깅만 남기고 계속
+            logger.debug(f"GPU monitoring failed after retries: {e}")
+        
+        # 기본 메트릭은 항상 기록
+        try:
+            team5_stt_requests.labels(service='whisper-stt').inc()
+            team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
+        except Exception as e:
+            logger.debug(f"Basic metrics failed: {e}")
+            
+        return response
+    else:
+        return await call_next(request)
+
+def get_gpu_metrics_with_retry(max_retries=3):
+    """GPU 메트릭을 재시도 로직과 함께 안전하게 가져오기"""
+    for attempt in range(max_retries):
+        try:
+            # 매번 새로 초기화 (이전 상태 영향 방지)
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             
-            start_time = time.time()
-            response = await call_next(request)
-            processing_time = time.time() - start_time
+            # GPU 상태 확인
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
             
-            # 처리 후 상태
-            util_after = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            mem_after = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return {
+                'utilization': util.gpu,
+                'memory_used': mem.used / 1024 / 1024
+            }
             
-            # 메트릭 업데이트
-            team5_gpu_utilization.labels(service='whisper-stt').set(util_after.gpu)
-            team5_gpu_memory_used.labels(service='whisper-stt').set(mem_after.used / 1024 / 1024)
-            team5_stt_requests.labels(service='whisper-stt').inc()
-            team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
-            
-            return response
         except Exception as e:
-            # GPU 모니터링 실패해도 API는 정상 동작하도록
-            logger.warning(f"GPU monitoring failed: {e}")
-            return await call_next(request)
-    else:
-        return await call_next(request)
+            if attempt < max_retries - 1:
+                # 재시도 전 잠시 대기
+                time.sleep(0.1)
+                continue
+            else:
+                # 모든 재시도 실패
+                return None
+    
+    return None
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error({
