@@ -41,7 +41,7 @@ pipeline {
             --runtime=nvidia \
             --gpus all \
             --network team5-net \
-            -p 8002:8666 \
+            -p 8001:8666 \
             -v /mnt/d/team5/server1-whisper:/app/data \
             -v /mnt/d/team5/server1-whisper/logs:/app/logs \
             "${IMAGE_NAME}:${IMAGE_TAG}"
