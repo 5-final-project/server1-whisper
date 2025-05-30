@@ -221,53 +221,54 @@ except Exception as e:
 
 
 # --- 배치 처리 함수 ---
-def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE, language: str = None):
+def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE, language: Optional[str] = None, initial_prompt: Optional[str] = None):
     """배치 처리를 활용해 오디오 파일을 한 번에 처리하는 함수. 요청 ID를 받아 로깅에 활용."""
-    # 오디오 길이(초) 계산
-    try:
-        with wave.open(audio_path, 'rb') as wf:
-            audio_duration_sec = wf.getnframes() / wf.getframerate()
-    except Exception:
-        audio_duration_sec = None
-
-    log_extra_base = {"transaction.id": request_id, "audio.path": audio_path, "stt.batch_size": batch_size, "audio.duration_sec": round(audio_duration_sec, 2) if audio_duration_sec else "N/A"}
-    logger.info("Starting audio processing (transcription)", extra=log_extra_base)
     start_time = time.time()
+    audio_duration_sec = 0 # 초기화
+
+    log_extra_base = {
+        "service.name": "whisper-stt",
+        "request.id": request_id,
+        "audio.path": os.path.basename(audio_path),
+        "stt.batch_size_configured": batch_size,
+        "stt.language_requested": language if language else "auto",
+        "stt.initial_prompt_provided": bool(initial_prompt),
+    }
 
     try:
-        transcription_options = {
-            "beam_size": 5, "vad_filter": True, "word_timestamps": True,
-            "condition_on_previous_text": True, "batch_size": batch_size,
-            "task": "transcribe", "best_of": 5, "temperature": 0,
-            "initial_prompt": "This is a business meeting recording."
+        logger.info(f"Starting STT batch processing for request {request_id}", extra=log_extra_base)
+
+        # 오디오 파일 길이 가져오기 (로깅 및 통계용)
+        try:
+            with wave.open(audio_path, 'rb') as wf:
+                audio_duration_sec = wf.getnframes() / wf.getframerate()
+        except Exception:
+            audio_duration_sec = None
+
+        log_extra_base["audio.duration_sec"] = round(audio_duration_sec, 2) if audio_duration_sec else "N/A"
+
+        # transcription_options 를 decode_options 로 명칭 변경하여 역할 명확화
+        decode_options = {
+            "language": language,
+            "word_timestamps": True, # 세그먼트 시간 정보 포함
+            # "condition_on_previous_text": False, # 테스트용: 문맥 의존성 낮춤
+            # "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0), # 다양성 증가 (기본값)
         }
-        # 🔽 이 아랫부분이 이전 제 코드에서 제공된 상세 로깅 및 STT 처리 로직입니다.
-        # 이 부분을 채워주시면 됩니다.
+        if initial_prompt:
+            decode_options["initial_prompt"] = initial_prompt
 
-        log_extra_transcribe = {**log_extra_base, "stt.options_preview": {k:v for k,v in transcription_options.items() if k != "initial_prompt"}} # 프롬프트는 길 수 있으므로 제외 또는 일부만
+        # Filter out None values to avoid passing them explicitly if they are meant to be default
+        decode_options = {k: v for k, v in decode_options.items() if v is not None}
 
-        if language:
-            transcription_options["language"] = language
-            log_extra_transcribe["stt.language.user_specified"] = language
-            if language == "ko":
-                transcription_options["initial_prompt"] = "This is a Korean business meeting recording. The primary language is Korean with occasional English terms or phrases. Please accurately transcribe the Korean speech while maintaining English terms that might be present. Focus on properly capturing Korean sentences with their natural flow and structure."
-                # 프롬프트 내용도 중요 정보이므로 로깅 (길다면 일부만)
-                log_extra_transcribe["stt.initial_prompt_used"] = transcription_options["initial_prompt"][:100] + "..." if len(transcription_options["initial_prompt"]) > 100 else transcription_options["initial_prompt"]
-                logger.info("Transcribing with specific Korean language settings and prompt", extra=log_extra_transcribe)
-            else:
-                log_extra_transcribe["stt.initial_prompt_used"] = transcription_options["initial_prompt"][:100] + "..." if len(transcription_options["initial_prompt"]) > 100 else transcription_options["initial_prompt"]
-                logger.info(f"Transcribing with specified language: {language}", extra=log_extra_transcribe)
-        else:
-            log_extra_transcribe["stt.initial_prompt_used"] = transcription_options["initial_prompt"][:100] + "..." if len(transcription_options["initial_prompt"]) > 100 else transcription_options["initial_prompt"]
-            logger.info("Transcribing with automatic language detection", extra=log_extra_transcribe)
-
-        # model 객체가 None이 아닌지 확인 (애플리케이션 시작 시 로드 실패 경우 대비)
-        if model is None:
-            logger.error("Whisper model is not loaded. Cannot perform transcription.", extra=log_extra_base)
+        if not model: # 모델 로드 실패 시 예외 발생
+            logger.critical(
+                "Whisper model is not loaded. Cannot perform transcription.",
+                extra=log_extra_base
+            )
             raise RuntimeError("Whisper model not available for transcription.")
 
-
-        segments_iterable, info = model.transcribe(audio_path, **transcription_options)
+        # model.transcribe 호출 시 batch_size 인자 명시적 전달
+        segments_iterable, info = model.transcribe(audio_path, batch_size=batch_size, **decode_options)
         segments_list = list(segments_iterable) # 제너레이터 소모 및 결과 로깅을 위해 리스트 변환
 
         # 최종 텍스트 통계
@@ -300,10 +301,10 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
 
 
 # --- FastAPI 엔드포인트 ---
-from typing import Optional
+from typing import Optional, List
 
 @app.post("/upload-audio")
-async def upload_audio(request: Request, file: UploadFile = File(...), meeting_info: str = Form("N/A"), language: Optional[str] = Form(None)):
+async def upload_audio(request: Request, file: UploadFile = File(...), meeting_info: str = Form("N/A"), language: Optional[str] = Form(None), title: str = Form(...), meeting_attendees: List[str] = Form([]), writer: str = Form(...)):
     """
     오디오 파일을 STT로 변환하여 전체 텍스트를 JSON 으로 반환합니다.
     """
@@ -311,6 +312,28 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
     start_time = time.time()
     # 요청 ID 가져오기
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+
+    # Construct initial_prompt from new form parameters
+    if language == "en":
+        prompt_attendees_en = ", ".join(meeting_attendees) if meeting_attendees else "No attendee information"
+        initial_prompt_text = f"This recording is about the following meeting:\nMeeting Title: {title}\nAttendees: {prompt_attendees_en}\nRecorder: {writer}\n"
+    else:  # Default to Korean for 'ko' or if language is not specified (None) or other values
+        prompt_attendees_ko = ", ".join(meeting_attendees) if meeting_attendees else "참석자 정보 없음"
+        initial_prompt_text = f"이 녹음은 다음 회의에 관한 것입니다:\n회의 제목: {title}\n참석자: {prompt_attendees_ko}\n작성자: {writer}\n"
+    
+    base_log_extra_upload = {"request_id": request_id, "service.name": "whisper-stt", "api.endpoint": "/upload-audio"}
+    logger.info(
+        "Initial prompt constructed for STT.",
+        extra={
+            **base_log_extra_upload,
+            "meeting.title": title,
+            "meeting.attendees_count": len(meeting_attendees) if meeting_attendees else 0,
+            "meeting.writer": writer,
+            "initial_prompt.length": len(initial_prompt_text),
+            "initial_prompt.language_used": "en" if language == "en" else "ko" # 프롬프트 언어 로깅
+        }
+    )
+
     # 임시 파일 저장
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     suffix = os.path.splitext(file.filename)[-1] if file.filename else ".tmp"
@@ -333,7 +356,7 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
         os.remove(temp_path)
 
     try:
-        segments, info = process_audio(converted_wav_path, request_id, BATCH_SIZE, language)
+        segments, info = process_audio(converted_wav_path, request_id, BATCH_SIZE, language, initial_prompt=initial_prompt_text)
         sorted_segments = sorted(segments, key=lambda s: s.start)
         full_text = "\n".join([segment.text.strip() for segment in sorted_segments])
         return {
