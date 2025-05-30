@@ -22,4 +22,4 @@ prometheus-fastapi-instrumentator>=7.0.0  # 추가: 자동 메트릭
 prometheus_client>=0.20.0
 
 # ─── GPU 모니터링 (통일) ──────────────────────────────────────
-pynvml>=11.4.1  # 변경: nvidia-ml-py3 → pynvml (공식 패키지)
+nvidia-ml-py3
