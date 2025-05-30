@@ -1,3 +1,6 @@
+# Server1-whisper 업데이트된 requirements.txt
+# (기존 패키지들 + 개선된 메트릭 패키지)
+
 fastapi==0.109.0
 uvicorn==0.27.0
 requests==2.31.0
@@ -14,9 +17,9 @@ hf_xet
 # 로그
 python-json-logger
 
-# Prometheus metrics (Instrumentator 버전이 기본)
-prometheus-fastapi-instrumentator
-
-# GPU 모니터링 및 직접 메트릭 생성을 위한 패키지
+# ─── Prometheus 메트릭 (개선) ──────────────────────────────────
+prometheus-fastapi-instrumentator>=7.0.0  # 추가: 자동 메트릭
 prometheus_client>=0.20.0
-nvidia-ml-py3  # 최신 사용 가능한 버전 자동 설치
+
+# ─── GPU 모니터링 (통일) ──────────────────────────────────────
+pynvml>=11.4.1  # 변경: nvidia-ml-py3 → pynvml (공식 패키지)
