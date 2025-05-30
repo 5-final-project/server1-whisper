@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional, List  # 이 라인 추가!
 import torch
 import os
 import uuid
@@ -12,7 +13,6 @@ import subprocess
 import wave
 import math
 from pythonjsonlogger import jsonlogger # 추가
-
 # 기존 코드 맨 위에 추가
 import pynvml
 from prometheus_client import Gauge, Counter, Histogram
@@ -300,8 +300,6 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
         raise # 예외를 다시 발생시켜 FastAPI가 처리하도록 함 (예: /upload-audio 핸들러의 except 블록)
 
 
-# --- FastAPI 엔드포인트 ---
-from typing import Optional, List
 
 @app.post("/upload-audio")
 async def upload_audio(request: Request, file: UploadFile = File(...), meeting_info: str = Form("N/A"), language: Optional[str] = Form(None), title: str = Form(...), meeting_attendees: List[str] = Form([]), writer: str = Form(...)):
