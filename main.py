@@ -1,33 +1,211 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, List  # 이 라인 추가!
+from typing import Optional, List
 import torch
 import os
 import uuid
 import time
 import shutil
 import logging
-import logging.handlers # 추가
+import logging.handlers
 import subprocess
 import wave
 import math
-from pythonjsonlogger import jsonlogger # 추가
+from pythonjsonlogger import jsonlogger
 # 기존 코드 맨 위에 추가
 import pynvml
 from prometheus_client import Gauge, Counter, Histogram
+# 새로 추가되는 import들
+import psutil
+import asyncio
+from contextlib import asynccontextmanager
+import threading
 
-# GPU 메트릭 정의
+# 기존 GPU 메트릭 정의
 team5_gpu_utilization = Gauge('team5_gpu_utilization_percent', 'Team5 GPU utilization', ['service'])
 team5_gpu_memory_used = Gauge('team5_gpu_memory_used_mb', 'Team5 GPU memory used', ['service'])
 team5_stt_requests = Counter('team5_stt_requests_total', 'Total STT requests', ['service'])
 team5_stt_duration = Histogram('team5_stt_processing_seconds', 'STT processing time', ['service'])
 
+# 새로운 프로세스별 GPU 메트릭 정의
+team5_process_gpu_memory = Gauge('team5_process_gpu_memory_mb', 'Process-specific GPU memory usage', ['service', 'container_id'])
+team5_process_gpu_utilization = Gauge('team5_process_gpu_utilization_percent', 'Process-specific GPU utilization estimation', ['service', 'container_id'])
+
+# GPU 핸들 캐싱을 위한 전역 변수
+_gpu_handle = None
+_gpu_handle_lock = threading.Lock()
+
+def get_container_id():
+    """현재 실행 중인 컨테이너 ID 획득"""
+    try:
+        with open('/proc/self/cgroup', 'r') as f:
+            for line in f:
+                if 'docker' in line:
+                    return line.strip().split('/')[-1][:12]
+        return 'unknown'
+    except:
+        return 'unknown'
+
+def get_cached_gpu_handle():
+    """GPU 핸들을 캐시하여 매번 초기화하지 않음"""
+    global _gpu_handle
+    if _gpu_handle is None:
+        with _gpu_handle_lock:
+            if _gpu_handle is None:
+                try:
+                    pynvml.nvmlInit()
+                    _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                except Exception as e:
+                    return None
+    return _gpu_handle
+
+def get_whisper_process_gpu_usage():
+    """Whisper 프로세스의 GPU 사용량 조회"""
+    try:
+        handle = get_cached_gpu_handle()
+        if handle is None:
+            return {'memory_mb': 0, 'utilization_percent': 0, 'container_id': get_container_id()}
+        
+        current_pid = os.getpid()
+        container_id = get_container_id()
+        
+        # GPU에서 실행 중인 모든 프로세스 조회
+        processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        
+        process_memory = 0
+        found_process = False
+        
+        for proc in processes:
+            try:
+                # 현재 프로세스인지 확인
+                if proc.pid == current_pid:
+                    process_memory = proc.usedGpuMemory / 1024 / 1024  # MB로 변환
+                    found_process = True
+                    break
+                    
+                # 같은 컨테이너의 Python 프로세스 확인
+                try:
+                    proc_info = psutil.Process(proc.pid)
+                    cmdline = ' '.join(proc_info.cmdline()).lower()
+                    if ('python' in proc_info.name().lower() and 
+                        ('whisper' in cmdline or 'main.py' in cmdline)):
+                        process_memory += proc.usedGpuMemory / 1024 / 1024
+                        found_process = True
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                    
+            except Exception:
+                continue
+        
+        # GPU 사용률 추정
+        estimated_utilization = 0
+        if found_process and process_memory > 0:
+            total_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            total_memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            
+            if total_memory.used > 0:
+                memory_ratio = process_memory / (total_memory.used / 1024 / 1024)
+                estimated_utilization = min(total_util.gpu * memory_ratio, 100)
+            
+        return {
+            'memory_mb': process_memory,
+            'utilization_percent': estimated_utilization,
+            'container_id': container_id
+        }
+            
+    except Exception as e:
+        return {
+            'memory_mb': 0,
+            'utilization_percent': 0,
+            'container_id': get_container_id()
+        }
+
+def get_gpu_metrics_fast():
+    """최적화된 전체 GPU 메트릭 수집 - 캐시된 핸들 사용"""
+    handle = get_cached_gpu_handle()
+    if handle is None:
+        return None
+    
+    try:
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return {
+            'utilization': util.gpu,
+            'memory_used': mem.used / 1024 / 1024
+        }
+    except Exception as e:
+        # 핸들 무효화하여 다음에 재초기화
+        global _gpu_handle
+        _gpu_handle = None
+        return None
+
+async def update_process_gpu_metrics_background(processing_time):
+    """백그라운드에서 프로세스별 GPU 메트릭 업데이트"""
+    try:
+        # 기본 메트릭 (빠른 처리)
+        team5_stt_requests.labels(service='whisper-stt').inc()
+        team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
+        
+        # 프로세스별 GPU 메트릭 (느릴 수 있음)
+        process_metrics = get_whisper_process_gpu_usage()
+        
+        team5_process_gpu_memory.labels(
+            service='whisper-stt', 
+            container_id=process_metrics['container_id']
+        ).set(process_metrics['memory_mb'])
+        
+        team5_process_gpu_utilization.labels(
+            service='whisper-stt', 
+            container_id=process_metrics['container_id']
+        ).set(process_metrics['utilization_percent'])
+        
+        # 전체 GPU 메트릭도 유지 (기존 대시보드 호환성)
+        gpu_metrics = get_gpu_metrics_fast()
+        if gpu_metrics:
+            team5_gpu_utilization.labels(service='whisper-stt').set(gpu_metrics['utilization'])
+            team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_metrics['memory_used'])
+            
+    except Exception as e:
+        pass  # 백그라운드 작업이므로 에러 무시
+
+# 주기적 프로세스 모니터링
+async def periodic_gpu_monitoring():
+    """5초마다 프로세스 GPU 사용량 업데이트"""
+    while True:
+        try:
+            process_metrics = get_whisper_process_gpu_usage()
+            
+            team5_process_gpu_memory.labels(
+                service='whisper-stt', 
+                container_id=process_metrics['container_id']
+            ).set(process_metrics['memory_mb'])
+            
+            team5_process_gpu_utilization.labels(
+                service='whisper-stt', 
+                container_id=process_metrics['container_id']
+            ).set(process_metrics['utilization_percent'])
+            
+        except Exception as e:
+            pass  # 주기적 작업이므로 에러 무시
+        
+        await asyncio.sleep(5)
+
+# lifespan 함수 추가
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 백그라운드 GPU 모니터링 시작
+    gpu_task = asyncio.create_task(periodic_gpu_monitoring())
+    yield
+    # 앱 종료 시 태스크 취소
+    gpu_task.cancel()
+
 # --- FastAPI 앱 생성 및 CORS 설정 ---
 app = FastAPI(
     title="Whisper STT API Server",
-    description="음성 파일을 텍스트로 변환하는 API (Batched Inference Pipeline 사용)",
-    version="1.0.0"
+    description="음성 파일을 텍스트로 변환하는 API (프로세스별 GPU 모니터링)",
+    version="1.0.0",
+    lifespan=lifespan  # lifespan 추가
 )
 
 # --- Global Exception Handler for Logging ---
@@ -37,63 +215,20 @@ from fastapi.exception_handlers import RequestValidationError
 from fastapi.exceptions import RequestValidationError as FastAPIRequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-
-# 더 안정적인 GPU 모니터링 미들웨어
+# 최적화된 GPU 모니터링 미들웨어 (백그라운드 처리)
 @app.middleware("http")
-async def gpu_monitoring_middleware(request: Request, call_next):
+async def optimized_gpu_monitoring_middleware(request: Request, call_next):
     if request.url.path == "/upload-audio":
         start_time = time.time()
         response = await call_next(request)  # 먼저 응답 처리
         processing_time = time.time() - start_time
         
-        # GPU 모니터링은 응답 처리 후에 안전하게 수행
-        try:
-            gpu_metrics = get_gpu_metrics_with_retry(max_retries=3)
-            if gpu_metrics:
-                team5_gpu_utilization.labels(service='whisper-stt').set(gpu_metrics['utilization'])
-                team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_metrics['memory_used'])
-        except Exception as e:
-            # GPU 모니터링 실패해도 로깅만 남기고 계속
-            logger.debug(f"GPU monitoring failed after retries: {e}")
-        
-        # 기본 메트릭은 항상 기록
-        try:
-            team5_stt_requests.labels(service='whisper-stt').inc()
-            team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
-        except Exception as e:
-            logger.debug(f"Basic metrics failed: {e}")
-            
+        # 백그라운드에서 비동기 실행 - 응답 즉시 반환!
+        asyncio.create_task(update_process_gpu_metrics_background(processing_time))
         return response
     else:
         return await call_next(request)
 
-def get_gpu_metrics_with_retry(max_retries=3):
-    """GPU 메트릭을 재시도 로직과 함께 안전하게 가져오기"""
-    for attempt in range(max_retries):
-        try:
-            # 매번 새로 초기화 (이전 상태 영향 방지)
-            pynvml.nvmlInit()
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            
-            # GPU 상태 확인
-            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            
-            return {
-                'utilization': util.gpu,
-                'memory_used': mem.used / 1024 / 1024
-            }
-            
-        except Exception as e:
-            if attempt < max_retries - 1:
-                # 재시도 전 잠시 대기
-                time.sleep(0.1)
-                continue
-            else:
-                # 모든 재시도 실패
-                return None
-    
-    return None
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error({
@@ -156,7 +291,6 @@ SERVICE_NAME = "whisper-stt-server" # ELK에서 이 서비스 식별 이름
 BATCH_SIZE = 16
 NUM_WORKERS = min(4, os.cpu_count() or 4)
 
-
 # --- 로깅 설정 ---
 logger = logging.getLogger(SERVICE_NAME)
 logger.setLevel(logging.DEBUG) # 개발 시에는 DEBUG, 실제 운영 시 INFO 등으로 조정
@@ -194,10 +328,6 @@ stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
 logger.addHandler(stream_handler) # 개발 중에는 콘솔 출력도 같이 보면 편합니다.
 
-# --- 기존 logging.basicConfig(level=logging.INFO) 부분은 삭제 또는 주석 처리 ---
-# logging.basicConfig(level=logging.INFO) # 이 줄은 주석 처리하거나 삭제합니다.
-
-
 # --- 모델 로드 ---
 # 모델 로드 시점에 대한 로그 (기본 정보 포함)
 base_log_extra_model_load = {"event.module": "initialization", "event.action": "load_model"}
@@ -218,7 +348,6 @@ except Exception as e:
   logger.critical(f"CRITICAL: Error loading Whisper model. Application may not work correctly.", exc_info=True, extra=base_log_extra_model_load)
   model = None
   base_model = None
-
 
 # --- 배치 처리 함수 ---
 def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE, language: Optional[str] = None, initial_prompt: Optional[str] = None):
@@ -299,8 +428,6 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
         )
         raise # 예외를 다시 발생시켜 FastAPI가 처리하도록 함 (예: /upload-audio 핸들러의 except 블록)
 
-
-
 @app.post("/upload-audio")
 async def upload_audio(request: Request, file: UploadFile = File(...), meeting_info: str = Form("N/A"), language: Optional[str] = Form(None), title: str = Form(...), meeting_attendees: List[str] = Form([]), writer: str = Form(...)):
     """
@@ -365,7 +492,6 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
     finally:
         if os.path.exists(converted_wav_path):
             os.remove(converted_wav_path)
-
 
 @app.get("/")
 async def read_root():
