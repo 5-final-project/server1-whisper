@@ -451,9 +451,8 @@ except Exception as e:
     model = None
     base_model = None
 
-# --- 배치 처리 함수 ---
-def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE, language: str = None):
-    """배치 처리를 활용해 오디오 파일을 한 번에 처리하는 함수"""
+def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE, language: str = None, initial_prompt: Optional[str] = None):
+    """배치 처리를 활용해 오디오 파일을 한 번에 처리하는 함수. 요청 ID를 받아 로깅에 활용."""
     try:
         with wave.open(audio_path, 'rb') as wf:
             audio_duration_sec = wf.getnframes() / wf.getframerate()
@@ -461,46 +460,54 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
         audio_duration_sec = None
 
     log_extra_base = {
-        "transaction.id": request_id, 
-        "audio.path": os.path.basename(audio_path), 
-        "stt.batch_size": batch_size, 
+        "service.name": "whisper-stt",
+        "request.id": request_id,
+        "audio.path": os.path.basename(audio_path),
+        "stt.batch_size_configured": batch_size,
+        "stt.language_requested": language if language else "auto",
+        "stt.initial_prompt_provided": bool(initial_prompt),
         "audio.duration_sec": round(audio_duration_sec, 2) if audio_duration_sec else "N/A"
     }
     
-    logger.info("🎤 STT 처리 시작", extra=log_extra_base)
+    logger.info(f"🎤 STT 배치 처리 시작 (요청 ID: {request_id})", extra=log_extra_base)
     start_time = time.time()
 
     try:
-        transcription_options = {
-            "beam_size": 5, 
-            "vad_filter": True, 
+        # decode_options 구성
+        decode_options = {
+            "language": language,
             "word_timestamps": True,
-            "condition_on_previous_text": True, 
-            "batch_size": batch_size,
-            "task": "transcribe", 
-            "best_of": 5, 
+            "beam_size": 5,
+            "vad_filter": True,
+            "condition_on_previous_text": True,
+            "task": "transcribe",
+            "best_of": 5,
             "temperature": 0
         }
-
-        if language:
-            transcription_options["language"] = language
-            if language == "ko":
-                transcription_options["initial_prompt"] = "이것은 한국어 비즈니스 회의 녹음입니다. 한국어를 정확하게 전사해주세요."
-            else:
-                transcription_options["initial_prompt"] = "This is a business meeting recording."
+        
+        # initial_prompt 설정
+        if initial_prompt:
+            decode_options["initial_prompt"] = initial_prompt
+        elif language == "ko":
+            decode_options["initial_prompt"] = "이것은 한국어 비즈니스 회의 녹음입니다. 한국어를 정확하게 전사해주세요."
         else:
-            transcription_options["initial_prompt"] = "This is a business meeting recording."
+            decode_options["initial_prompt"] = "This is a business meeting recording."
+
+        # Filter out None values
+        decode_options = {k: v for k, v in decode_options.items() if v is not None}
 
         if model is None:
-            logger.error("❌ Whisper 모델이 로드되지 않음", extra=log_extra_base)
-            raise RuntimeError("Whisper model not available")
+            logger.critical("❌ Whisper 모델이 로드되지 않음", extra=log_extra_base)
+            raise RuntimeError("Whisper model not available for transcription.")
 
         # GPU 모니터링 강화 (처리 시작 시)
         update_realistic_gpu_metrics()
 
-        segments_iterable, info = model.transcribe(audio_path, **transcription_options)
+        # model.transcribe 호출 시 batch_size 인자 명시적 전달
+        segments_iterable, info = model.transcribe(audio_path, batch_size=batch_size, **decode_options)
         segments_list = list(segments_iterable)
 
+        # 최종 텍스트 통계
         transcript_word_count = sum(len(segment.text.strip().split()) for segment in segments_list)
         end_time = time.time()
         processing_time_sec = end_time - start_time
@@ -512,7 +519,8 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
             "stt.language.probability": round(info.language_probability, 4) if info else "N/A",
             "stt.num_segments": len(segments_list),
             "transcript.word_count": transcript_word_count,
-            "stt.throughput_ratio": round(processing_time_sec / audio_duration_sec, 2) if audio_duration_sec else "N/A"
+            "stt.throughput_ratio": round(processing_time_sec / audio_duration_sec, 2) if audio_duration_sec else "N/A",
+            "stt.words_per_sec": round(transcript_word_count / processing_time_sec, 2) if processing_time_sec else "N/A",
         }
         
         logger.info("✅ STT 처리 완료", extra=final_log_extra)
@@ -525,19 +533,49 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
     except Exception as e:
         elapsed_time_sec = time.time() - start_time
         logger.error(
-            "❌ STT 처리 실패",
+            "❌ STT 배치 처리 실패",
             exc_info=True,
-            extra={**log_extra_base, "error.message": str(e), "stt.processing_time_before_error": round(elapsed_time_sec, 2)}
+            extra={**log_extra_base, "error.message_detail": str(e), "stt.processing_time_sec_before_error": round(elapsed_time_sec, 2)}
         )
         raise
-
 @app.post("/upload-audio")
-async def upload_audio(request: Request, file: UploadFile = File(...), meeting_info: str = Form("N/A"), language: Optional[str] = Form(None)):
-    """오디오 파일을 STT로 변환하여 전체 텍스트를 JSON으로 반환"""
+async def upload_audio(
+    request: Request, 
+    file: UploadFile = File(...), 
+    meeting_info: str = Form("N/A"), 
+    language: Optional[str] = Form(None), 
+    title: str = Form(...), 
+    meeting_attendees: List[str] = Form([]), 
+    writer: str = Form(...)
+):
+    """
+    오디오 파일을 STT로 변환하여 전체 텍스트를 JSON으로 반환합니다.
+    """
     import tempfile
     start_time = time.time()
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+
+    # Construct initial_prompt from form parameters
+    if language == "en":
+        prompt_attendees_en = ", ".join(meeting_attendees) if meeting_attendees else "No attendee information"
+        initial_prompt_text = f"This recording is about the following meeting:\nMeeting Title: {title}\nAttendees: {prompt_attendees_en}\nRecorder: {writer}\n"
+    else:  # Default to Korean for 'ko' or if language is not specified (None) or other values
+        prompt_attendees_ko = ", ".join(meeting_attendees) if meeting_attendees else "참석자 정보 없음"
+        initial_prompt_text = f"이 녹음은 다음 회의에 관한 것입니다:\n회의 제목: {title}\n참석자: {prompt_attendees_ko}\n작성자: {writer}\n"
     
+    base_log_extra_upload = {"request_id": request_id, "service.name": "whisper-stt", "api.endpoint": "/upload-audio"}
+    logger.info(
+        "🎤 Initial prompt 생성 완료",
+        extra={
+            **base_log_extra_upload,
+            "meeting.title": title,
+            "meeting.attendees_count": len(meeting_attendees) if meeting_attendees else 0,
+            "meeting.writer": writer,
+            "initial_prompt.length": len(initial_prompt_text),
+            "initial_prompt.language_used": "en" if language == "en" else "ko"
+        }
+    )
+
     # 임시 파일 저장
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     suffix = os.path.splitext(file.filename)[-1] if file.filename else ".tmp"
@@ -545,7 +583,7 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
         shutil.copyfileobj(file.file, temp_file)
         temp_path = temp_file.name
 
-    # wav 변환
+    # wav 변환 (필요 시)
     converted_wav_path = temp_path
     if not temp_path.lower().endswith(".wav"):
         converted_wav_path = temp_path + ".wav"
@@ -560,7 +598,7 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
         os.remove(temp_path)
 
     try:
-        segments, info = process_audio(converted_wav_path, request_id, BATCH_SIZE, language)
+        segments, info = process_audio(converted_wav_path, request_id, BATCH_SIZE, language, initial_prompt=initial_prompt_text)
         sorted_segments = sorted(segments, key=lambda s: s.start)
         full_text = "\n".join([segment.text.strip() for segment in sorted_segments])
         
@@ -572,7 +610,6 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
     finally:
         if os.path.exists(converted_wav_path):
             os.remove(converted_wav_path)
-
 @app.get("/")
 async def read_root():
     """Root health check"""
