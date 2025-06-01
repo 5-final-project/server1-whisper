@@ -20,6 +20,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import threading
 import re
+import math
 
 # GPU 메트릭 정의
 team5_gpu_utilization = Gauge('team5_gpu_utilization_percent', 'Team5 GPU utilization', ['service'])
@@ -153,79 +154,86 @@ def count_whisper_processes():
         return 2  # 기본값
 
 def estimate_process_gpu_memory_smart(total_memory_mb: float, gpu_utilization: int) -> float:
-    """현실적인 프로세스별 GPU 메모리 추정 (재수정된 버전)"""
+    """실시간 반응하는 프로세스별 GPU 메모리 추정"""
     global gpu_memory_tracker
     
     current_time = time.time()
     baseline = gpu_memory_tracker['baseline_memory_mb']
     process_count = max(gpu_memory_tracker['whisper_process_count'], 1)
     
-    # 방법 1: GPU 사용률이 높을 때 (실제 STT 처리 중)
-    if gpu_utilization > 50:
+    # 🔥 방법 1: 높은 GPU 사용률 (50% 이상) - 실시간 반응
+    if gpu_utilization >= 50:
+        # 베이스라인 + 사용률에 비례한 동적 메모리
         if baseline > 0:
-            # 처리 중일 때는 베이스라인 + 추가 동적 메모리
-            active_memory = max(0, total_memory_mb - baseline)
-            estimated = baseline * 0.5 + active_memory * 0.6  # 더 보수적으로
-        else:
-            estimated = total_memory_mb * 0.6  # 전체의 60%
-        
-        gpu_memory_tracker['estimated_per_process_mb'] = estimated
-        gpu_memory_tracker['last_high_usage_time'] = current_time
-        
-        logger.debug(f"🔥 고사용률 감지 ({gpu_utilization}%): 프로세스당 {estimated:.1f}MB 추정")
-        return estimated
-    
-    # 방법 2: 중간 사용률 (30-50%)
-    elif gpu_utilization > 30:
-        if baseline > 0:
-            estimated = baseline * 0.4 + (total_memory_mb - baseline) * 0.3
-        else:
-            estimated = total_memory_mb * 0.4
+            # 사용률에 따른 추가 메모리 계산
+            utilization_factor = gpu_utilization / 100.0
+            dynamic_memory = baseline * (0.3 + utilization_factor * 0.7)  # 30% ~ 100%
             
+            # 전체 메모리 고려
+            max_dynamic = total_memory_mb * (0.4 + utilization_factor * 0.4)  # 40% ~ 80%
+            estimated = min(dynamic_memory, max_dynamic)
+        else:
+            # 베이스라인이 없으면 사용률 기반으로만
+            estimated = total_memory_mb * (0.3 + gpu_utilization / 100.0 * 0.5)  # 30% ~ 80%
+        
+        # 값 저장 및 시간 기록
         gpu_memory_tracker['estimated_per_process_mb'] = estimated
         gpu_memory_tracker['last_high_usage_time'] = current_time
         
-        logger.debug(f"⚡ 중간사용률 ({gpu_utilization}%): 프로세스당 {estimated:.1f}MB 추정")
+        logger.info(f"🔥 고사용률 ({gpu_utilization}%): 프로세스 메모리 {estimated:.1f}MB 추정")
         return estimated
     
-    # 방법 3: 최근에 높은 사용률이 있었던 경우 (1분 이내)
-    if current_time - gpu_memory_tracker['last_high_usage_time'] < 60:
+    # ⚡ 방법 2: 중간 GPU 사용률 (20-49%) - 점진적 증가
+    elif gpu_utilization >= 20:
+        if baseline > 0:
+            # 사용률에 비례한 점진적 증가
+            utilization_factor = gpu_utilization / 100.0
+            estimated = baseline * (0.25 + utilization_factor * 0.5)  # 25% ~ 75%
+        else:
+            estimated = total_memory_mb * (0.2 + utilization_factor * 0.4)  # 20% ~ 60%
+        
+        gpu_memory_tracker['estimated_per_process_mb'] = estimated
+        gpu_memory_tracker['last_high_usage_time'] = current_time
+        
+        logger.info(f"⚡ 중간사용률 ({gpu_utilization}%): 프로세스 메모리 {estimated:.1f}MB 추정")
+        return estimated
+    
+    # 📊 방법 3: 최근 고사용률의 감쇠 (5분간)
+    time_since_high = current_time - gpu_memory_tracker['last_high_usage_time']
+    if time_since_high < 300:  # 5분 이내
         recent_estimate = gpu_memory_tracker['estimated_per_process_mb']
         if recent_estimate > 0:
-            # 시간이 지날수록 감소
-            time_factor = max(0.3, 1.0 - (current_time - gpu_memory_tracker['last_high_usage_time']) / 60.0)
-            decayed_estimate = recent_estimate * time_factor
-            logger.debug(f"📊 최근 사용량 기반 (감쇠): {decayed_estimate:.1f}MB (원래: {recent_estimate:.1f}MB)")
+            # 시간에 따른 지수적 감쇠 (빠른 감소)
+            decay_factor = max(0.2, math.exp(-time_since_high / 120))  # 2분 시상수
+            decayed_estimate = recent_estimate * decay_factor
+            
+            logger.debug(f"📊 감쇠 적용: {decayed_estimate:.1f}MB (원래: {recent_estimate:.1f}MB, {time_since_high:.0f}초 전)")
             return decayed_estimate
     
-    # 방법 4: 유휴 상태 - 베이스라인 기반 (현실적 비율)
+    # 🏠 방법 4: 유휴 상태 베이스라인 (GPU < 20%)
     if baseline > 0:
-        # 🔧 유휴 상태에서는 베이스라인의 30%만 사용한다고 가정
-        idle_estimate = baseline * 0.3
+        # 🔧 유휴 상태에서는 베이스라인의 20-30% 사용
+        idle_ratio = 0.2 + (gpu_utilization / 100.0) * 0.1  # 20% ~ 30%
+        idle_estimate = baseline * idle_ratio
         
-        # 🔧 추가 안전장치: 전체 메모리의 50%를 넘지 않도록
-        max_allowed = total_memory_mb * 0.5
-        idle_estimate = min(idle_estimate, max_allowed)
+        # 전체 메모리의 40%를 넘지 않도록
+        max_idle = total_memory_mb * 0.4
+        idle_estimate = min(idle_estimate, max_idle)
         
-        logger.debug(f"🏠 유휴상태 베이스라인: {idle_estimate:.1f}MB (베이스라인의 30%)")
+        logger.debug(f"🏠 유휴상태 ({gpu_utilization}%): {idle_estimate:.1f}MB (베이스라인 {idle_ratio*100:.0f}%)")
         return idle_estimate
     
-    # 방법 5: nvidia-smi 파싱 시도
-    nvidia_smi_result = try_nvidia_smi_parsing()
-    if nvidia_smi_result > 0:
-        # nvidia-smi 결과도 현실적 범위로 제한
-        realistic_result = min(nvidia_smi_result, total_memory_mb * 0.6)
-        logger.debug(f"⚡ nvidia-smi 파싱 (제한됨): {realistic_result:.1f}MB")
-        return realistic_result
-    
-    # 방법 6: 최종 기본값 (매우 보수적)
+    # 🎯 방법 5: 최종 기본값 (베이스라인 없음)
     if total_memory_mb > 1000:
-        # 🔧 전체 메모리의 25%를 기본값으로 (매우 보수적)
-        default_estimate = total_memory_mb * 0.25
-        logger.debug(f"🎯 보수적 기본값: {default_estimate:.1f}MB (전체의 25%)")
+        # GPU 사용률에 따른 기본 추정
+        base_ratio = 0.15 + (gpu_utilization / 100.0) * 0.25  # 15% ~ 40%
+        default_estimate = total_memory_mb * base_ratio
+        
+        logger.debug(f"🎯 기본 추정 ({gpu_utilization}%): {default_estimate:.1f}MB")
         return default_estimate
     
     return 0.0
+
 
 def try_nvidia_smi_parsing() -> float:
     """nvidia-smi 파싱으로 프로세스 메모리 획득 시도"""
@@ -259,34 +267,38 @@ def try_nvidia_smi_parsing() -> float:
     return 0.0
 
 def update_realistic_gpu_metrics():
-    """현실적인 GPU 메트릭 업데이트 (최종 버전)"""
+    """실시간 반응 GPU 메트릭 업데이트"""
     try:
         gpu_info = get_gpu_info_enhanced()
         
         if gpu_info is None:
-            logger.debug("GPU 정보 수집 실패, 메트릭 업데이트 건너뜀")
+            logger.debug("GPU 정보 수집 실패")
             return
         
-        # 전체 GPU 메트릭 (정확한 값)
+        # 전체 GPU 메트릭
         team5_gpu_utilization.labels(service='whisper-stt').set(gpu_info['total_utilization'])
         team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_info['total_memory_mb'])
         
-        # 프로세스별 메트릭 (현실적 추정값)
+        # 🔥 실시간 반응하는 프로세스별 메트릭
         estimated_memory = gpu_info['estimated_process_memory_mb']
-        memory_ratio = gpu_info['memory_ratio']
         
-        # 프로세스 사용률 추정 (메모리 비율 기반)
-        if memory_ratio > 0.5:  # 50% 이상 사용시
-            estimated_utilization = min(gpu_info['total_utilization'] * 0.8, 100)
-        elif memory_ratio > 0.3:  # 30% 이상 사용시
-            estimated_utilization = min(gpu_info['total_utilization'] * 0.6, 100)
-        else:  # 30% 미만 사용시
-            estimated_utilization = min(gpu_info['total_utilization'] * 0.4, 100)
+        # 프로세스 사용률도 실시간 계산
+        gpu_util = gpu_info['total_utilization']
+        if gpu_util >= 50:
+            # 고사용률: 프로세스가 GPU의 60-80% 책임
+            estimated_utilization = min(gpu_util * 0.7, 100)
+        elif gpu_util >= 20:
+            # 중간사용률: 프로세스가 GPU의 40-60% 책임
+            estimated_utilization = min(gpu_util * 0.5, 100)
+        else:
+            # 저사용률: 프로세스가 GPU의 20-40% 책임
+            estimated_utilization = min(gpu_util * 0.3, 100)
         
-        # 최소 사용률 보장
-        if estimated_memory > 1000:  # 1GB 이상이면 최소 2%
-            estimated_utilization = max(estimated_utilization, 2)
+        # 최소값 보장
+        if estimated_memory > 500:  # 500MB 이상이면 최소 사용률 보장
+            estimated_utilization = max(estimated_utilization, 3)
         
+        # 메트릭 업데이트
         team5_process_gpu_memory.labels(
             service='whisper-stt', 
             container_id=gpu_info['container_id']
@@ -297,30 +309,18 @@ def update_realistic_gpu_metrics():
             container_id=gpu_info['container_id']
         ).set(estimated_utilization)
         
-        # 현실적 비율인지 검증하여 로깅
-        if memory_ratio > 0.8:
-            log_level = "warning"
-            emoji = "⚠️"
-        elif memory_ratio > 0.6:
-            log_level = "info"
-            emoji = "🔶"
-        else:
-            log_level = "debug"
-            emoji = "✅"
-            
-        log_message = (
-            f"{emoji} GPU 메트릭: "
-            f"전체={gpu_info['total_memory_mb']:.1f}MB({gpu_info['total_utilization']}%), "
-            f"프로세스={estimated_memory:.1f}MB({estimated_utilization:.1f}%), "
-            f"비율={memory_ratio*100:.1f}%"
-        )
+        # 변화 감지 로깅
+        memory_ratio = estimated_memory / gpu_info['total_memory_mb'] if gpu_info['total_memory_mb'] > 0 else 0
         
-        if log_level == "warning":
-            logger.warning(log_message)
-        elif log_level == "info":
-            logger.info(log_message)
-        else:
-            logger.debug(log_message)
+        # GPU 사용률이 높거나 메모리 변화가 클 때 로깅
+        if gpu_util > 30 or abs(estimated_memory - gpu_memory_tracker.get('last_logged_memory', 0)) > 500:
+            logger.info(
+                f"🎯 실시간 GPU 추적: "
+                f"전체={gpu_info['total_memory_mb']:.1f}MB({gpu_util}%), "
+                f"프로세스={estimated_memory:.1f}MB({estimated_utilization:.1f}%), "
+                f"비율={memory_ratio*100:.1f}%"
+            )
+            gpu_memory_tracker['last_logged_memory'] = estimated_memory
             
     except Exception as e:
         logger.error(f"GPU 메트릭 업데이트 실패: {e}")
