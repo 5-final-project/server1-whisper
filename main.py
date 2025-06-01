@@ -13,42 +13,63 @@ import subprocess
 import wave
 import math
 from pythonjsonlogger import jsonlogger
-# 기존 코드 맨 위에 추가
 import pynvml
 from prometheus_client import Gauge, Counter, Histogram
-# 새로 추가되는 import들
 import psutil
 import asyncio
 from contextlib import asynccontextmanager
 import threading
+import re
 
-# 기존 GPU 메트릭 정의
+# GPU 메트릭 정의
 team5_gpu_utilization = Gauge('team5_gpu_utilization_percent', 'Team5 GPU utilization', ['service'])
 team5_gpu_memory_used = Gauge('team5_gpu_memory_used_mb', 'Team5 GPU memory used', ['service'])
 team5_stt_requests = Counter('team5_stt_requests_total', 'Total STT requests', ['service'])
 team5_stt_duration = Histogram('team5_stt_processing_seconds', 'STT processing time', ['service'])
 
-# 새로운 프로세스별 GPU 메트릭 정의
-team5_process_gpu_memory = Gauge('team5_process_gpu_memory_mb', 'Process-specific GPU memory usage', ['service', 'container_id'])
-team5_process_gpu_utilization = Gauge('team5_process_gpu_utilization_percent', 'Process-specific GPU utilization estimation', ['service', 'container_id'])
+# 프로세스별 GPU 메트릭 (추정 기반)
+team5_process_gpu_memory = Gauge('team5_process_gpu_memory_mb', 'Estimated process GPU memory', ['service', 'container_id'])
+team5_process_gpu_utilization = Gauge('team5_process_gpu_utilization_percent', 'Estimated process GPU utilization', ['service', 'container_id'])
 
-# GPU 핸들 캐싱을 위한 전역 변수
+# GPU 메모리 추적기 (Windows WSL2 환경 대응)
+gpu_memory_tracker = {
+    'baseline_memory_mb': 0,  # 모델 로딩 시 베이스라인
+    'peak_memory_mb': 0,      # 최대 사용량
+    'last_high_usage_time': 0,  # 마지막 고사용량 시간
+    'estimated_per_process_mb': 0,  # 추정 프로세스별 메모리
+    'whisper_process_count': 2,  # 기본 Whisper 프로세스 수
+    'model_loaded': False
+}
+
+# GPU 핸들 캐싱
 _gpu_handle = None
 _gpu_handle_lock = threading.Lock()
 
 def get_container_id():
-    """현재 실행 중인 컨테이너 ID 획득"""
+    """컨테이너 ID 획득 (여러 방법 시도)"""
     try:
+        # 방법 1: /proc/self/cgroup
         with open('/proc/self/cgroup', 'r') as f:
             for line in f:
                 if 'docker' in line:
-                    return line.strip().split('/')[-1][:12]
-        return 'unknown'
+                    container_id = line.strip().split('/')[-1][:12]
+                    if len(container_id) >= 12:
+                        return container_id
+        
+        # 방법 2: hostname
+        with open('/etc/hostname', 'r') as f:
+            hostname = f.read().strip()
+            if len(hostname) >= 12:
+                return hostname[:12]
+                
+        # 방법 3: 환경변수
+        return os.environ.get('HOSTNAME', 'unknown')[:12]
+        
     except:
         return 'unknown'
 
 def get_cached_gpu_handle():
-    """GPU 핸들을 캐시하여 매번 초기화하지 않음"""
+    """GPU 핸들 캐시 (재초기화 최소화)"""
     global _gpu_handle
     if _gpu_handle is None:
         with _gpu_handle_lock:
@@ -57,155 +78,225 @@ def get_cached_gpu_handle():
                     pynvml.nvmlInit()
                     _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
                 except Exception as e:
+                    logger.debug(f"GPU 핸들 초기화 실패: {e}")
                     return None
     return _gpu_handle
 
-def get_whisper_process_gpu_usage():
-    """Whisper 프로세스의 GPU 사용량 조회"""
+def get_gpu_info_enhanced():
+    """Windows WSL2 환경에 최적화된 GPU 정보 수집"""
+    global gpu_memory_tracker
+    
     try:
         handle = get_cached_gpu_handle()
         if handle is None:
-            return {'memory_mb': 0, 'utilization_percent': 0, 'container_id': get_container_id()}
-        
-        current_pid = os.getpid()
-        container_id = get_container_id()
-        
-        # GPU에서 실행 중인 모든 프로세스 조회
-        processes = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
-        
-        process_memory = 0
-        found_process = False
-        
-        for proc in processes:
-            try:
-                # 현재 프로세스인지 확인
-                if proc.pid == current_pid:
-                    process_memory = proc.usedGpuMemory / 1024 / 1024  # MB로 변환
-                    found_process = True
-                    break
-                    
-                # 같은 컨테이너의 Python 프로세스 확인
-                try:
-                    proc_info = psutil.Process(proc.pid)
-                    cmdline = ' '.join(proc_info.cmdline()).lower()
-                    if ('python' in proc_info.name().lower() and 
-                        ('whisper' in cmdline or 'main.py' in cmdline)):
-                        process_memory += proc.usedGpuMemory / 1024 / 1024
-                        found_process = True
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-                    
-            except Exception:
-                continue
-        
-        # GPU 사용률 추정
-        estimated_utilization = 0
-        if found_process and process_memory > 0:
-            total_util = pynvml.nvmlDeviceGetUtilizationRates(handle)
-            total_memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            return None
             
-            if total_memory.used > 0:
-                memory_ratio = process_memory / (total_memory.used / 1024 / 1024)
-                estimated_utilization = min(total_util.gpu * memory_ratio, 100)
-            
-        return {
-            'memory_mb': process_memory,
-            'utilization_percent': estimated_utilization,
-            'container_id': container_id
-        }
-            
-    except Exception as e:
-        return {
-            'memory_mb': 0,
-            'utilization_percent': 0,
-            'container_id': get_container_id()
-        }
-
-def get_gpu_metrics_fast():
-    """최적화된 전체 GPU 메트릭 수집 - 캐시된 핸들 사용"""
-    handle = get_cached_gpu_handle()
-    if handle is None:
-        return None
-    
-    try:
+        # 1. 전체 GPU 상태 수집
         util = pynvml.nvmlDeviceGetUtilizationRates(handle)
         mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        total_memory_mb = mem.used / 1024 / 1024
+        
+        # 2. 베이스라인 메모리 설정 (모델 로딩 완료 후)
+        if not gpu_memory_tracker['model_loaded'] and total_memory_mb > 1000:
+            gpu_memory_tracker['baseline_memory_mb'] = total_memory_mb
+            gpu_memory_tracker['model_loaded'] = True
+            logger.info(f"🎯 GPU 베이스라인 메모리 설정: {total_memory_mb:.1f}MB")
+        
+        # 3. GPU 프로세스 카운트 (실제 확인)
+        whisper_process_count = count_whisper_processes()
+        if whisper_process_count > 0:
+            gpu_memory_tracker['whisper_process_count'] = whisper_process_count
+        
+        # 4. 프로세스별 메모리 추정
+        estimated_process_memory = estimate_process_gpu_memory_smart(
+            total_memory_mb, util.gpu
+        )
+        
+        # 5. 피크 메모리 추적
+        if total_memory_mb > gpu_memory_tracker['peak_memory_mb']:
+            gpu_memory_tracker['peak_memory_mb'] = total_memory_mb
+        
         return {
-            'utilization': util.gpu,
-            'memory_used': mem.used / 1024 / 1024
+            'total_utilization': util.gpu,
+            'total_memory_mb': total_memory_mb,
+            'estimated_process_memory_mb': estimated_process_memory,
+            'process_count': gpu_memory_tracker['whisper_process_count'],
+            'container_id': get_container_id(),
+            'baseline_memory_mb': gpu_memory_tracker['baseline_memory_mb'],
+            'peak_memory_mb': gpu_memory_tracker['peak_memory_mb']
         }
+        
     except Exception as e:
-        # 핸들 무효화하여 다음에 재초기화
-        global _gpu_handle
-        _gpu_handle = None
+        logger.debug(f"GPU 정보 수집 실패: {e}")
         return None
 
-async def update_process_gpu_metrics_background(processing_time):
-    """백그라운드에서 프로세스별 GPU 메트릭 업데이트"""
+def count_whisper_processes():
+    """Whisper 관련 프로세스 수 카운트"""
     try:
-        # 기본 메트릭 (빠른 처리)
-        team5_stt_requests.labels(service='whisper-stt').inc()
-        team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
+        whisper_count = 0
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            try:
+                cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
+                name = proc.info['name'].lower()
+                
+                # Whisper/FastAPI 관련 프로세스 탐지
+                keywords = ['uvicorn', 'main.py', 'whisper', 'fastapi', 'faster-whisper']
+                if any(keyword in cmdline.lower() or keyword in name for keyword in keywords):
+                    whisper_count += 1
+                    
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+                
+        return max(whisper_count, 1)  # 최소 1개는 보장
         
-        # 프로세스별 GPU 메트릭 (느릴 수 있음)
-        process_metrics = get_whisper_process_gpu_usage()
+    except Exception:
+        return 2  # 기본값
+
+def estimate_process_gpu_memory_smart(total_memory_mb: float, gpu_utilization: int) -> float:
+    """지능형 프로세스별 GPU 메모리 추정"""
+    global gpu_memory_tracker
+    
+    current_time = time.time()
+    baseline = gpu_memory_tracker['baseline_memory_mb']
+    process_count = gpu_memory_tracker['whisper_process_count']
+    
+    # 방법 1: GPU 사용률이 높을 때 (실제 STT 처리 중)
+    if gpu_utilization > 30:
+        if baseline > 0:
+            # 베이스라인 제외한 활성 메모리를 프로세스별로 분배
+            active_memory = max(0, total_memory_mb - baseline)
+            estimated = (baseline + active_memory) / process_count
+        else:
+            # 베이스라인이 없으면 전체를 분배
+            estimated = total_memory_mb / process_count
+        
+        # 추정값 업데이트 및 시간 기록
+        gpu_memory_tracker['estimated_per_process_mb'] = estimated
+        gpu_memory_tracker['last_high_usage_time'] = current_time
+        
+        logger.debug(f"🔥 고사용률 감지 ({gpu_utilization}%): 프로세스당 {estimated:.1f}MB 추정")
+        return estimated
+    
+    # 방법 2: GPU 사용률이 낮지만 최근에 높았던 경우
+    if current_time - gpu_memory_tracker['last_high_usage_time'] < 60:  # 1분 이내
+        recent_estimate = gpu_memory_tracker['estimated_per_process_mb']
+        if recent_estimate > 0:
+            logger.debug(f"📊 최근 사용량 기반: {recent_estimate:.1f}MB")
+            return recent_estimate
+    
+    # 방법 3: 베이스라인 기반 추정 (유휴 상태)
+    if baseline > 0:
+        baseline_per_process = baseline / process_count
+        logger.debug(f"🏠 베이스라인 기반: {baseline_per_process:.1f}MB")
+        return baseline_per_process
+    
+    # 방법 4: nvidia-smi 파싱 시도 (최후 수단)
+    nvidia_smi_result = try_nvidia_smi_parsing()
+    if nvidia_smi_result > 0:
+        logger.debug(f"⚡ nvidia-smi 파싱: {nvidia_smi_result:.1f}MB")
+        return nvidia_smi_result
+    
+    # 방법 5: 기본 추정값 (경험적 값)
+    if total_memory_mb > 1000:
+        default_estimate = total_memory_mb * 0.4  # 전체의 40% 추정
+        logger.debug(f"🎯 기본 추정: {default_estimate:.1f}MB")
+        return default_estimate
+    
+    return 0.0
+
+def try_nvidia_smi_parsing() -> float:
+    """nvidia-smi 파싱으로 프로세스 메모리 획득 시도"""
+    try:
+        result = subprocess.run(
+            ['nvidia-smi', '--query-compute-apps=pid,used_memory', '--format=csv,noheader,nounits'],
+            capture_output=True, text=True, timeout=3
+        )
+        
+        if result.returncode == 0 and result.stdout.strip():
+            total_memory = 0
+            process_count = 0
+            
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    try:
+                        parts = line.split(', ')
+                        if len(parts) >= 2 and parts[1] != '[Not Supported]':
+                            memory_mb = float(parts[1])
+                            total_memory += memory_mb
+                            process_count += 1
+                    except (ValueError, IndexError):
+                        continue
+            
+            if process_count > 0:
+                return total_memory / process_count
+                
+    except Exception as e:
+        logger.debug(f"nvidia-smi 파싱 실패: {e}")
+    
+    return 0.0
+
+def update_realistic_gpu_metrics():
+    """현실적인 GPU 메트릭 업데이트 (Windows WSL2 최적화)"""
+    try:
+        gpu_info = get_gpu_info_enhanced()
+        
+        if gpu_info is None:
+            logger.debug("GPU 정보 수집 실패, 메트릭 업데이트 건너뜀")
+            return
+        
+        # 전체 GPU 메트릭 (정확한 값)
+        team5_gpu_utilization.labels(service='whisper-stt').set(gpu_info['total_utilization'])
+        team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_info['total_memory_mb'])
+        
+        # 프로세스별 메트릭 (추정값)
+        estimated_memory = gpu_info['estimated_process_memory_mb']
+        estimated_utilization = min(gpu_info['total_utilization'] * 0.7, 100) if estimated_memory > 100 else 0
         
         team5_process_gpu_memory.labels(
             service='whisper-stt', 
-            container_id=process_metrics['container_id']
-        ).set(process_metrics['memory_mb'])
+            container_id=gpu_info['container_id']
+        ).set(estimated_memory)
         
         team5_process_gpu_utilization.labels(
             service='whisper-stt', 
-            container_id=process_metrics['container_id']
-        ).set(process_metrics['utilization_percent'])
+            container_id=gpu_info['container_id']
+        ).set(estimated_utilization)
         
-        # 전체 GPU 메트릭도 유지 (기존 대시보드 호환성)
-        gpu_metrics = get_gpu_metrics_fast()
-        if gpu_metrics:
-            team5_gpu_utilization.labels(service='whisper-stt').set(gpu_metrics['utilization'])
-            team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_metrics['memory_used'])
+        # 주요 업데이트 시에만 로깅
+        if estimated_memory > 500 or gpu_info['total_utilization'] > 20:
+            logger.info(
+                f"🎯 GPU 메트릭 업데이트: "
+                f"전체={gpu_info['total_memory_mb']:.1f}MB({gpu_info['total_utilization']}%), "
+                f"프로세스={estimated_memory:.1f}MB, "
+                f"베이스라인={gpu_info['baseline_memory_mb']:.1f}MB"
+            )
             
     except Exception as e:
-        pass  # 백그라운드 작업이므로 에러 무시
+        logger.error(f"GPU 메트릭 업데이트 실패: {e}")
 
-# 주기적 프로세스 모니터링
-async def periodic_gpu_monitoring():
-    """5초마다 프로세스 GPU 사용량 업데이트"""
-    while True:
-        try:
-            process_metrics = get_whisper_process_gpu_usage()
-            
-            team5_process_gpu_memory.labels(
-                service='whisper-stt', 
-                container_id=process_metrics['container_id']
-            ).set(process_metrics['memory_mb'])
-            
-            team5_process_gpu_utilization.labels(
-                service='whisper-stt', 
-                container_id=process_metrics['container_id']
-            ).set(process_metrics['utilization_percent'])
-            
-        except Exception as e:
-            pass  # 주기적 작업이므로 에러 무시
-        
-        await asyncio.sleep(5)
-
-# lifespan 함수 추가
+# lifespan 함수 (주기적 모니터링)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 백그라운드 GPU 모니터링 시작
+    async def periodic_gpu_monitoring():
+        while True:
+            try:
+                update_realistic_gpu_metrics()
+            except Exception as e:
+                logger.debug(f"주기적 GPU 모니터링 에러: {e}")
+            await asyncio.sleep(10)  # 10초마다 실행
+    
     gpu_task = asyncio.create_task(periodic_gpu_monitoring())
     yield
     # 앱 종료 시 태스크 취소
     gpu_task.cancel()
 
-# --- FastAPI 앱 생성 및 CORS 설정 ---
+# --- FastAPI 앱 생성 ---
 app = FastAPI(
     title="Whisper STT API Server",
-    description="음성 파일을 텍스트로 변환하는 API (프로세스별 GPU 모니터링)",
-    version="1.0.0",
-    lifespan=lifespan  # lifespan 추가
+    description="음성 파일을 텍스트로 변환하는 API (Windows WSL2 GPU 모니터링 최적화)",
+    version="2.0.0",
+    lifespan=lifespan
 )
 
 # --- Global Exception Handler for Logging ---
@@ -215,19 +306,32 @@ from fastapi.exception_handlers import RequestValidationError
 from fastapi.exceptions import RequestValidationError as FastAPIRequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-# 최적화된 GPU 모니터링 미들웨어 (백그라운드 처리)
+# 최적화된 GPU 모니터링 미들웨어
 @app.middleware("http")
-async def optimized_gpu_monitoring_middleware(request: Request, call_next):
+async def enhanced_gpu_monitoring_middleware(request: Request, call_next):
     if request.url.path == "/upload-audio":
         start_time = time.time()
-        response = await call_next(request)  # 먼저 응답 처리
+        response = await call_next(request)
         processing_time = time.time() - start_time
         
-        # 백그라운드에서 비동기 실행 - 응답 즉시 반환!
-        asyncio.create_task(update_process_gpu_metrics_background(processing_time))
+        # 백그라운드에서 비동기 메트릭 업데이트
+        asyncio.create_task(update_metrics_background(processing_time))
         return response
     else:
         return await call_next(request)
+
+async def update_metrics_background(processing_time: float):
+    """백그라운드 메트릭 업데이트"""
+    try:
+        # 기본 STT 메트릭
+        team5_stt_requests.labels(service='whisper-stt').inc()
+        team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
+        
+        # GPU 메트릭 (즉시 업데이트)
+        update_realistic_gpu_metrics()
+        
+    except Exception as e:
+        logger.debug(f"백그라운드 메트릭 업데이트 실패: {e}")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
@@ -279,130 +383,125 @@ app.add_middleware(
 # --- 설정 ---
 MODEL_SIZE = "medium"
 if torch.cuda.is_available():
-  DEVICE = "cuda"
-  COMPUTE_TYPE = "float16"
+    DEVICE = "cuda"
+    COMPUTE_TYPE = "float16"
 else:
-  DEVICE = "cpu"
-  COMPUTE_TYPE = "int8"
+    DEVICE = "cpu"
+    COMPUTE_TYPE = "int8"
 
-UPLOAD_DIR = "temp_audio" # 업로드된 오디오 임시 저장 폴더
-LOGS_DIR = "logs"         # 로그 파일 저장 폴더
-SERVICE_NAME = "whisper-stt-server" # ELK에서 이 서비스 식별 이름
+UPLOAD_DIR = "temp_audio"
+LOGS_DIR = "logs"
+SERVICE_NAME = "whisper-stt-server"
 BATCH_SIZE = 16
 NUM_WORKERS = min(4, os.cpu_count() or 4)
 
 # --- 로깅 설정 ---
 logger = logging.getLogger(SERVICE_NAME)
-logger.setLevel(logging.DEBUG) # 개발 시에는 DEBUG, 실제 운영 시 INFO 등으로 조정
-logger.propagate = False # 루트 로거로의 전파 방지 (중복 로깅 방지)
+logger.setLevel(logging.INFO)  # INFO로 변경 (DEBUG는 너무 많은 로그)
+logger.propagate = False
 
-# 로그 폴더 생성
 os.makedirs(LOGS_DIR, exist_ok=True)
 LOG_FILE_PATH = os.path.join(LOGS_DIR, "whisper_server.log")
 
-# JSON 포맷터
 class CustomJsonFormatter(jsonlogger.JsonFormatter):
     def add_fields(self, log_record, record, message_dict):
         super(CustomJsonFormatter, self).add_fields(log_record, record, message_dict)
-        if not log_record.get('@timestamp'): # 이미 @timestamp가 있다면 사용 (Filebeat 등에서 설정 가능)
+        if not log_record.get('@timestamp'):
             log_record['@timestamp'] = logging.Formatter().formatTime(record, datefmt='%Y-%m-%dT%H:%M:%S.%fZ')
         if record.levelname:
             log_record['log.level'] = record.levelname.upper()
         else:
-            log_record['log.level'] = 'INFO' # 기본값
+            log_record['log.level'] = 'INFO'
         log_record['service.name'] = SERVICE_NAME
-        # transaction.id는 로깅 호출 시 extra로 전달받아 자동으로 포함됨
 
-# 포맷터 인스턴스 생성
 formatter = CustomJsonFormatter()
 
-# 파일 핸들러 (RotatingFileHandler)
 file_handler = logging.handlers.RotatingFileHandler(
     LOG_FILE_PATH, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
 )
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# 콘솔 핸들러 (개발 시 확인용 - JSON 포맷터 동일하게 적용)
 stream_handler = logging.StreamHandler()
 stream_handler.setFormatter(formatter)
-logger.addHandler(stream_handler) # 개발 중에는 콘솔 출력도 같이 보면 편합니다.
+logger.addHandler(stream_handler)
 
 # --- 모델 로드 ---
-# 모델 로드 시점에 대한 로그 (기본 정보 포함)
 base_log_extra_model_load = {"event.module": "initialization", "event.action": "load_model"}
 logger.info(
-    f"Attempting to load Whisper model '{MODEL_SIZE}' on device '{DEVICE}' with compute_type '{COMPUTE_TYPE}'",
+    f"🚀 Whisper 모델 로딩 시작: '{MODEL_SIZE}' on '{DEVICE}' with '{COMPUTE_TYPE}'",
     extra={**base_log_extra_model_load, "model.size": MODEL_SIZE, "model.device": DEVICE, "model.compute_type": COMPUTE_TYPE}
 )
+
 try:
-  base_model = WhisperModel(
-    MODEL_SIZE,
-    device=DEVICE,
-    compute_type=COMPUTE_TYPE,
-    cpu_threads=NUM_WORKERS,
-  )
-  model = BatchedInferencePipeline(model=base_model)
-  logger.info("Whisper model with batched pipeline loaded successfully.", extra=base_log_extra_model_load)
+    base_model = WhisperModel(
+        MODEL_SIZE,
+        device=DEVICE,
+        compute_type=COMPUTE_TYPE,
+        cpu_threads=NUM_WORKERS,
+    )
+    model = BatchedInferencePipeline(model=base_model)
+    
+    # 모델 로딩 완료 후 GPU 상태 확인
+    update_realistic_gpu_metrics()
+    
+    logger.info("✅ Whisper 모델 로딩 완료!", extra=base_log_extra_model_load)
 except Exception as e:
-  logger.critical(f"CRITICAL: Error loading Whisper model. Application may not work correctly.", exc_info=True, extra=base_log_extra_model_load)
-  model = None
-  base_model = None
+    logger.critical(f"❌ Whisper 모델 로딩 실패: {e}", exc_info=True, extra=base_log_extra_model_load)
+    model = None
+    base_model = None
 
 # --- 배치 처리 함수 ---
-def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE, language: Optional[str] = None, initial_prompt: Optional[str] = None):
-    """배치 처리를 활용해 오디오 파일을 한 번에 처리하는 함수. 요청 ID를 받아 로깅에 활용."""
-    start_time = time.time()
-    audio_duration_sec = 0 # 초기화
+def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE, language: str = None):
+    """배치 처리를 활용해 오디오 파일을 한 번에 처리하는 함수"""
+    try:
+        with wave.open(audio_path, 'rb') as wf:
+            audio_duration_sec = wf.getnframes() / wf.getframerate()
+    except Exception:
+        audio_duration_sec = None
 
     log_extra_base = {
-        "service.name": "whisper-stt",
-        "request.id": request_id,
-        "audio.path": os.path.basename(audio_path),
-        "stt.batch_size_configured": batch_size,
-        "stt.language_requested": language if language else "auto",
-        "stt.initial_prompt_provided": bool(initial_prompt),
+        "transaction.id": request_id, 
+        "audio.path": os.path.basename(audio_path), 
+        "stt.batch_size": batch_size, 
+        "audio.duration_sec": round(audio_duration_sec, 2) if audio_duration_sec else "N/A"
     }
+    
+    logger.info("🎤 STT 처리 시작", extra=log_extra_base)
+    start_time = time.time()
 
     try:
-        logger.info(f"Starting STT batch processing for request {request_id}", extra=log_extra_base)
-
-        # 오디오 파일 길이 가져오기 (로깅 및 통계용)
-        try:
-            with wave.open(audio_path, 'rb') as wf:
-                audio_duration_sec = wf.getnframes() / wf.getframerate()
-        except Exception:
-            audio_duration_sec = None
-
-        log_extra_base["audio.duration_sec"] = round(audio_duration_sec, 2) if audio_duration_sec else "N/A"
-
-        # transcription_options 를 decode_options 로 명칭 변경하여 역할 명확화
-        decode_options = {
-            "language": language,
-            "word_timestamps": True, # 세그먼트 시간 정보 포함
-            # "condition_on_previous_text": False, # 테스트용: 문맥 의존성 낮춤
-            # "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0), # 다양성 증가 (기본값)
+        transcription_options = {
+            "beam_size": 5, 
+            "vad_filter": True, 
+            "word_timestamps": True,
+            "condition_on_previous_text": True, 
+            "batch_size": batch_size,
+            "task": "transcribe", 
+            "best_of": 5, 
+            "temperature": 0
         }
-        if initial_prompt:
-            decode_options["initial_prompt"] = initial_prompt
 
-        # Filter out None values to avoid passing them explicitly if they are meant to be default
-        decode_options = {k: v for k, v in decode_options.items() if v is not None}
+        if language:
+            transcription_options["language"] = language
+            if language == "ko":
+                transcription_options["initial_prompt"] = "이것은 한국어 비즈니스 회의 녹음입니다. 한국어를 정확하게 전사해주세요."
+            else:
+                transcription_options["initial_prompt"] = "This is a business meeting recording."
+        else:
+            transcription_options["initial_prompt"] = "This is a business meeting recording."
 
-        if not model: # 모델 로드 실패 시 예외 발생
-            logger.critical(
-                "Whisper model is not loaded. Cannot perform transcription.",
-                extra=log_extra_base
-            )
-            raise RuntimeError("Whisper model not available for transcription.")
+        if model is None:
+            logger.error("❌ Whisper 모델이 로드되지 않음", extra=log_extra_base)
+            raise RuntimeError("Whisper model not available")
 
-        # model.transcribe 호출 시 batch_size 인자 명시적 전달
-        segments_iterable, info = model.transcribe(audio_path, batch_size=batch_size, **decode_options)
-        segments_list = list(segments_iterable) # 제너레이터 소모 및 결과 로깅을 위해 리스트 변환
+        # GPU 모니터링 강화 (처리 시작 시)
+        update_realistic_gpu_metrics()
 
-        # 최종 텍스트 통계
+        segments_iterable, info = model.transcribe(audio_path, **transcription_options)
+        segments_list = list(segments_iterable)
+
         transcript_word_count = sum(len(segment.text.strip().split()) for segment in segments_list)
-
         end_time = time.time()
         processing_time_sec = end_time - start_time
 
@@ -413,52 +512,32 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
             "stt.language.probability": round(info.language_probability, 4) if info else "N/A",
             "stt.num_segments": len(segments_list),
             "transcript.word_count": transcript_word_count,
-            "stt.throughput_ratio": round(processing_time_sec / audio_duration_sec, 2) if audio_duration_sec else "N/A",
-            "stt.words_per_sec": round(transcript_word_count / processing_time_sec, 2) if processing_time_sec else "N/A",
+            "stt.throughput_ratio": round(processing_time_sec / audio_duration_sec, 2) if audio_duration_sec else "N/A"
         }
-        logger.info("Transcription completed successfully", extra=final_log_extra)
-        return segments_list, info # 정상 완료 시 결과 반환
+        
+        logger.info("✅ STT 처리 완료", extra=final_log_extra)
+        
+        # GPU 모니터링 강화 (처리 완료 시)
+        update_realistic_gpu_metrics()
+        
+        return segments_list, info
 
     except Exception as e:
-        elapsed_time_sec = time.time() - start_time # 에러 발생 시점까지의 시간
+        elapsed_time_sec = time.time() - start_time
         logger.error(
-            "Error during STT batch processing",
-            exc_info=True, # 스택 트레이스 포함
-            extra={**log_extra_base, "error.message_detail": str(e), "stt.processing_time_sec_before_error": round(elapsed_time_sec, 2)}
+            "❌ STT 처리 실패",
+            exc_info=True,
+            extra={**log_extra_base, "error.message": str(e), "stt.processing_time_before_error": round(elapsed_time_sec, 2)}
         )
-        raise # 예외를 다시 발생시켜 FastAPI가 처리하도록 함 (예: /upload-audio 핸들러의 except 블록)
+        raise
 
 @app.post("/upload-audio")
-async def upload_audio(request: Request, file: UploadFile = File(...), meeting_info: str = Form("N/A"), language: Optional[str] = Form(None), title: str = Form(...), meeting_attendees: List[str] = Form([]), writer: str = Form(...)):
-    """
-    오디오 파일을 STT로 변환하여 전체 텍스트를 JSON 으로 반환합니다.
-    """
+async def upload_audio(request: Request, file: UploadFile = File(...), meeting_info: str = Form("N/A"), language: Optional[str] = Form(None)):
+    """오디오 파일을 STT로 변환하여 전체 텍스트를 JSON으로 반환"""
     import tempfile
     start_time = time.time()
-    # 요청 ID 가져오기
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-
-    # Construct initial_prompt from new form parameters
-    if language == "en":
-        prompt_attendees_en = ", ".join(meeting_attendees) if meeting_attendees else "No attendee information"
-        initial_prompt_text = f"This recording is about the following meeting:\nMeeting Title: {title}\nAttendees: {prompt_attendees_en}\nRecorder: {writer}\n"
-    else:  # Default to Korean for 'ko' or if language is not specified (None) or other values
-        prompt_attendees_ko = ", ".join(meeting_attendees) if meeting_attendees else "참석자 정보 없음"
-        initial_prompt_text = f"이 녹음은 다음 회의에 관한 것입니다:\n회의 제목: {title}\n참석자: {prompt_attendees_ko}\n작성자: {writer}\n"
     
-    base_log_extra_upload = {"request_id": request_id, "service.name": "whisper-stt", "api.endpoint": "/upload-audio"}
-    logger.info(
-        "Initial prompt constructed for STT.",
-        extra={
-            **base_log_extra_upload,
-            "meeting.title": title,
-            "meeting.attendees_count": len(meeting_attendees) if meeting_attendees else 0,
-            "meeting.writer": writer,
-            "initial_prompt.length": len(initial_prompt_text),
-            "initial_prompt.language_used": "en" if language == "en" else "ko" # 프롬프트 언어 로깅
-        }
-    )
-
     # 임시 파일 저장
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     suffix = os.path.splitext(file.filename)[-1] if file.filename else ".tmp"
@@ -466,7 +545,7 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
         shutil.copyfileobj(file.file, temp_file)
         temp_path = temp_file.name
 
-    # wav 변환 (필요 시)
+    # wav 변환
     converted_wav_path = temp_path
     if not temp_path.lower().endswith(".wav"):
         converted_wav_path = temp_path + ".wav"
@@ -481,9 +560,10 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
         os.remove(temp_path)
 
     try:
-        segments, info = process_audio(converted_wav_path, request_id, BATCH_SIZE, language, initial_prompt=initial_prompt_text)
+        segments, info = process_audio(converted_wav_path, request_id, BATCH_SIZE, language)
         sorted_segments = sorted(segments, key=lambda s: s.start)
         full_text = "\n".join([segment.text.strip() for segment in sorted_segments])
+        
         return {
             "text": full_text,
             "meeting_info": meeting_info,
@@ -495,10 +575,28 @@ async def upload_audio(request: Request, file: UploadFile = File(...), meeting_i
 
 @app.get("/")
 async def read_root():
-    """
-    Root health check.
-    """
-    return {"message": "Whisper STT API Server with BatchedInferencePipeline is running"}
+    """Root health check"""
+    return {"message": "🚀 Whisper STT API Server with Enhanced GPU Monitoring is running"}
 
+@app.get("/gpu-status")
+async def get_gpu_status():
+    """GPU 상태 확인 엔드포인트"""
+    gpu_info = get_gpu_info_enhanced()
+    if gpu_info:
+        return {
+            "status": "available",
+            "utilization_percent": gpu_info['total_utilization'],
+            "memory_used_mb": gpu_info['total_memory_mb'],
+            "estimated_process_memory_mb": gpu_info['estimated_process_memory_mb'],
+            "baseline_memory_mb": gpu_info['baseline_memory_mb'],
+            "peak_memory_mb": gpu_info['peak_memory_mb'],
+            "process_count": gpu_info['process_count'],
+            "container_id": gpu_info['container_id']
+        }
+    else:
+        return {"status": "unavailable"}
+
+# Prometheus 메트릭 노출
 from prometheus_fastapi_instrumentator import Instrumentator
 Instrumentator().instrument(app).expose(app)
+##
