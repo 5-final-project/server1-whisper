@@ -1,3 +1,5 @@
+# main.py - 확실한 정보만 모니터링하는 버전
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from faster_whisper import WhisperModel, BatchedInferencePipeline
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +15,6 @@ import subprocess
 import wave
 import math
 from pythonjsonlogger import jsonlogger
-import pynvml
 from prometheus_client import Gauge, Counter, Histogram
 import psutil
 import asyncio
@@ -21,184 +22,81 @@ from contextlib import asynccontextmanager
 import threading
 import re
 
-# GPU 메트릭 정의
+# ✅ 확실한 메트릭만 정의 (추정 메트릭 제거)
 team5_gpu_utilization = Gauge('team5_gpu_utilization_percent', 'Team5 GPU utilization', ['service'])
 team5_gpu_memory_used = Gauge('team5_gpu_memory_used_mb', 'Team5 GPU memory used', ['service'])
 team5_stt_requests = Counter('team5_stt_requests_total', 'Total STT requests', ['service'])
 team5_stt_duration = Histogram('team5_stt_processing_seconds', 'STT processing time', ['service'])
 
-# 프로세스별 GPU 메트릭 (정확한 측정 기반)
-team5_process_gpu_memory = Gauge('team5_process_gpu_memory_mb', 'Estimated process GPU memory', ['service', 'container_id'])
-team5_process_gpu_utilization = Gauge('team5_process_gpu_utilization_percent', 'Estimated process GPU utilization', ['service', 'container_id'])
+# ❌ 제거된 메트릭들 (WSL2에서 정확 측정 불가)
+# team5_process_gpu_memory = Gauge('team5_process_gpu_memory_mb', 'Estimated process GPU memory', ['service', 'container_id'])
+# team5_process_gpu_utilization = Gauge('team5_process_gpu_utilization_percent', 'Estimated process GPU utilization', ['service', 'container_id'])
 
-def get_container_id():
-    """컨테이너 ID 획득 (여러 방법 시도)"""
+def get_reliable_gpu_info():
+    """확실한 GPU 정보만 수집 (nvidia-smi 기반)"""
     try:
-        # 방법 1: /proc/self/cgroup
-        with open('/proc/self/cgroup', 'r') as f:
-            for line in f:
-                if 'docker' in line:
-                    container_id = line.strip().split('/')[-1][:12]
-                    if len(container_id) >= 12:
-                        return container_id
-        
-        # 방법 2: hostname
-        with open('/etc/hostname', 'r') as f:
-            hostname = f.read().strip()
-            if len(hostname) >= 12:
-                return hostname[:12]
-                
-        # 방법 3: 환경변수
-        return os.environ.get('HOSTNAME', 'unknown')[:12]
-        
-    except:
-        return 'unknown'
-
-def get_accurate_gpu_info():
-    """nvidia-smi를 직접 사용한 정확한 GPU 정보 수집"""
-    try:
-        # 1. 전체 GPU 상태 (utilization, memory)
-        gpu_query = subprocess.run([
+        # 전체 GPU 상태만 수집 (100% 신뢰 가능)
+        result = subprocess.run([
             'nvidia-smi', 
             '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw',
             '--format=csv,noheader,nounits'
         ], capture_output=True, text=True, timeout=5)
         
-        if gpu_query.returncode != 0:
+        if result.returncode != 0:
             return None
             
-        gpu_line = gpu_query.stdout.strip()
+        gpu_line = result.stdout.strip()
         if not gpu_line:
             return None
             
         # GPU 상태 파싱
         gpu_parts = [x.strip() for x in gpu_line.split(',')]
-        total_utilization = int(gpu_parts[0]) if gpu_parts[0] != '[Not Supported]' else 0
-        total_memory_mb = float(gpu_parts[1]) if gpu_parts[1] != '[Not Supported]' else 0
-        total_memory_capacity = float(gpu_parts[2]) if gpu_parts[2] != '[Not Supported]' else 10240
-        temperature = float(gpu_parts[3]) if gpu_parts[3] != '[Not Supported]' else 0
-        power_draw = float(gpu_parts[4]) if gpu_parts[4] != '[Not Supported]' else 0
-        
-        # 2. 프로세스별 정보 (PID, 메모리 사용량)
-        process_query = subprocess.run([
-            'nvidia-smi',
-            '--query-compute-apps=pid,used_memory',
-            '--format=csv,noheader,nounits'
-        ], capture_output=True, text=True, timeout=5)
-        
-        whisper_processes = []
-        total_process_memory = 0
-        
-        if process_query.returncode == 0 and process_query.stdout.strip():
-            for line in process_query.stdout.strip().split('\n'):
-                if line.strip():
-                    try:
-                        parts = [x.strip() for x in line.split(',')]
-                        if len(parts) >= 2 and parts[1] != '[Not Supported]':
-                            pid = int(parts[0])
-                            memory_mb = float(parts[1])
-                            
-                            # PID로 프로세스 정보 확인
-                            if is_whisper_process(pid):
-                                whisper_processes.append({
-                                    'pid': pid,
-                                    'memory_mb': memory_mb
-                                })
-                            total_process_memory += memory_mb
-                    except (ValueError, IndexError):
-                        continue
-        
-        # 3. Whisper 프로세스 정보 계산
-        whisper_memory_mb = sum(p['memory_mb'] for p in whisper_processes)
-        whisper_process_count = len(whisper_processes)
-        
-        # 4. Whisper 프로세스 GPU 사용률 추정 (메모리 비율 기반)
-        if whisper_memory_mb > 0 and total_memory_mb > 0:
-            # 메모리 비율 기반 사용률 추정
-            memory_ratio = whisper_memory_mb / total_memory_mb
-            estimated_whisper_utilization = total_utilization * memory_ratio
-        else:
-            estimated_whisper_utilization = 0
+        utilization = int(gpu_parts[0]) if gpu_parts[0] != '[Not Supported]' else 0
+        memory_used_mb = float(gpu_parts[1]) if gpu_parts[1] != '[Not Supported]' else 0
+        memory_total_mb = float(gpu_parts[2]) if gpu_parts[2] != '[Not Supported]' else 10240
+        temperature_c = float(gpu_parts[3]) if gpu_parts[3] != '[Not Supported]' else 0
+        power_draw_w = float(gpu_parts[4]) if gpu_parts[4] != '[Not Supported]' else 0
         
         return {
-            'total_utilization': total_utilization,
-            'total_memory_mb': total_memory_mb,
-            'total_memory_capacity_mb': total_memory_capacity,
-            'temperature_c': temperature,
-            'power_draw_w': power_draw,
-            'whisper_processes': whisper_processes,
-            'whisper_memory_mb': whisper_memory_mb,
-            'whisper_process_count': max(whisper_process_count, 1),  # 최소 1개
-            'estimated_whisper_utilization': round(estimated_whisper_utilization, 1),
-            'container_id': get_container_id()
+            'utilization_percent': utilization,
+            'memory_used_mb': memory_used_mb,
+            'memory_total_mb': memory_total_mb,
+            'temperature_celsius': temperature_c,
+            'power_draw_watts': power_draw_w
         }
         
     except Exception as e:
-        logger.debug(f"nvidia-smi GPU 정보 수집 실패: {e}")
+        logger.debug(f"GPU 정보 수집 실패: {e}")
         return None
 
-def is_whisper_process(pid):
-    """PID가 Whisper 관련 프로세스인지 확인"""
+def update_reliable_gpu_metrics():
+    """신뢰할 수 있는 GPU 메트릭만 업데이트"""
     try:
-        proc = psutil.Process(pid)
-        cmdline = ' '.join(proc.cmdline()).lower()
-        name = proc.name().lower()
-        
-        # Whisper/FastAPI 관련 키워드
-        whisper_keywords = [
-            'whisper', 'fastapi', 'uvicorn', 'main.py',
-            'faster-whisper', 'whisper-stt', 'stt'
-        ]
-        
-        return any(keyword in cmdline or keyword in name for keyword in whisper_keywords)
-        
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return False
-
-def update_accurate_gpu_metrics():
-    """정확한 GPU 메트릭 업데이트"""
-    try:
-        gpu_info = get_accurate_gpu_info()
+        gpu_info = get_reliable_gpu_info()
         
         if gpu_info is None:
             logger.debug("GPU 정보 수집 실패, 메트릭 업데이트 건너뜀")
             return
         
-        # 1. 전체 GPU 메트릭 (nvidia-smi 직접 값)
-        team5_gpu_utilization.labels(service='whisper-stt').set(gpu_info['total_utilization'])
-        team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_info['total_memory_mb'])
+        # ✅ 확실한 전체 GPU 메트릭만 업데이트
+        team5_gpu_utilization.labels(service='whisper-stt').set(gpu_info['utilization_percent'])
+        team5_gpu_memory_used.labels(service='whisper-stt').set(gpu_info['memory_used_mb'])
         
-        # 2. Whisper 프로세스별 메트릭 (실제 측정값)
-        whisper_memory = gpu_info['whisper_memory_mb']
-        whisper_utilization = gpu_info['estimated_whisper_utilization']
-        
-        team5_process_gpu_memory.labels(
-            service='whisper-stt', 
-            container_id=gpu_info['container_id']
-        ).set(whisper_memory)
-        
-        team5_process_gpu_utilization.labels(
-            service='whisper-stt', 
-            container_id=gpu_info['container_id']
-        ).set(whisper_utilization)
-        
-        # 3. 로깅 (중요한 변화만)
-        if gpu_info['total_utilization'] > 5 or whisper_memory > 500:
+        # 📊 의미 있는 변화만 로깅
+        if gpu_info['utilization_percent'] > 10:
             logger.info(
-                f"🎯 실시간 GPU 추적: "
-                f"전체={gpu_info['total_memory_mb']:.1f}MB({gpu_info['total_utilization']}%), "
-                f"프로세스={whisper_memory:.1f}MB({whisper_utilization}%), "
-                f"비율={whisper_memory/gpu_info['total_memory_mb']*100:.1f}%"
+                f"🖥️ GPU 활성 상태: {gpu_info['utilization_percent']}% 사용률, "
+                f"{gpu_info['memory_used_mb']:.0f}MB/{gpu_info['memory_total_mb']:.0f}MB 메모리"
             )
         else:
             # 유휴 상태 로깅 (덜 빈번하게)
-            if hasattr(update_accurate_gpu_metrics, '_idle_log_counter'):
-                update_accurate_gpu_metrics._idle_log_counter += 1
+            if hasattr(update_reliable_gpu_metrics, '_idle_counter'):
+                update_reliable_gpu_metrics._idle_counter += 1
             else:
-                update_accurate_gpu_metrics._idle_log_counter = 1
+                update_reliable_gpu_metrics._idle_counter = 1
                 
-            if update_accurate_gpu_metrics._idle_log_counter % 6 == 0:  # 1분마다 (10초 * 6)
-                logger.info(f"🏠 유휴상태 ({gpu_info['total_utilization']}%): {whisper_memory:.1f}MB (베이스라인 {gpu_info['total_memory_mb']:.1f}MB의 {whisper_memory/gpu_info['total_memory_mb']*100:.1f}%)")
+            if update_reliable_gpu_metrics._idle_counter % 6 == 0:  # 1분마다
+                logger.info(f"🏠 GPU 유휴 상태: {gpu_info['utilization_percent']}% 사용률")
                 
     except Exception as e:
         logger.error(f"GPU 메트릭 업데이트 실패: {e}")
@@ -206,18 +104,17 @@ def update_accurate_gpu_metrics():
 # lifespan 함수 (주기적 모니터링)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 백그라운드 GPU 모니터링 시작
-    logger.info("🚀 FastAPI 애플리케이션 시작 - 백그라운드 GPU 모니터링 시작")
+    logger.info("🚀 FastAPI 애플리케이션 시작 - 신뢰할 수 있는 GPU 모니터링 시작")
     
     async def periodic_gpu_monitoring():
         monitor_count = 0
         while True:
             try:
                 monitor_count += 1
-                update_accurate_gpu_metrics()
+                update_reliable_gpu_metrics()
                 
                 if monitor_count % 6 == 0:  # 1분마다
-                    logger.info(f"✅ GPU 모니터링 {monitor_count}회 완료")
+                    logger.info(f"✅ 신뢰성 기반 GPU 모니터링 {monitor_count}회 완료")
                     
             except Exception as e:
                 logger.debug(f"주기적 GPU 모니터링 에러: {e}")
@@ -235,8 +132,8 @@ async def lifespan(app: FastAPI):
 # --- FastAPI 앱 생성 ---
 app = FastAPI(
     title="Whisper STT API Server",
-    description="음성 파일을 텍스트로 변환하는 API (정확한 GPU 모니터링)",
-    version="3.0.0",
+    description="음성 파일을 텍스트로 변환하는 API (신뢰할 수 있는 GPU 모니터링)",
+    version="3.1.0",
     lifespan=lifespan
 )
 
@@ -247,9 +144,9 @@ from fastapi.exception_handlers import RequestValidationError
 from fastapi.exceptions import RequestValidationError as FastAPIRequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-# 최적화된 GPU 모니터링 미들웨어
+# GPU 모니터링 미들웨어 (확실한 메트릭만)
 @app.middleware("http")
-async def enhanced_gpu_monitoring_middleware(request: Request, call_next):
+async def reliable_gpu_monitoring_middleware(request: Request, call_next):
     if request.url.path == "/upload-audio":
         start_time = time.time()
         response = await call_next(request)
@@ -262,14 +159,14 @@ async def enhanced_gpu_monitoring_middleware(request: Request, call_next):
         return await call_next(request)
 
 async def update_metrics_background(processing_time: float):
-    """백그라운드 메트릭 업데이트"""
+    """백그라운드 메트릭 업데이트 (확실한 메트릭만)"""
     try:
-        # 기본 STT 메트릭
+        # ✅ 확실한 STT 메트릭
         team5_stt_requests.labels(service='whisper-stt').inc()
         team5_stt_duration.labels(service='whisper-stt').observe(processing_time)
         
-        # GPU 메트릭 (즉시 업데이트)
-        update_accurate_gpu_metrics()
+        # ✅ 확실한 GPU 메트릭 (즉시 업데이트)
+        update_reliable_gpu_metrics()
         
     except Exception as e:
         logger.debug(f"백그라운드 메트릭 업데이트 실패: {e}")
@@ -383,9 +280,9 @@ try:
     )
     model = BatchedInferencePipeline(model=base_model)
     
-    # 모델 로딩 완료 후 정확한 GPU 상태 확인
-    logger.info("🎯 GPU 베이스라인 메모리 설정: 모델 로딩 완료")
-    update_accurate_gpu_metrics()
+    # 모델 로딩 완료 후 신뢰할 수 있는 GPU 상태 확인
+    logger.info("🎯 신뢰할 수 있는 GPU 모니터링 시작")
+    update_reliable_gpu_metrics()
     
     logger.info("✅ Whisper 모델 로딩 완료!", extra=base_log_extra_model_load)
 except Exception as e:
@@ -443,8 +340,8 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
             logger.critical("❌ Whisper 모델이 로드되지 않음", extra=log_extra_base)
             raise RuntimeError("Whisper model not available for transcription.")
 
-        # GPU 모니터링 강화 (처리 시작 시)
-        update_accurate_gpu_metrics()
+        # GPU 모니터링 (처리 시작 시)
+        update_reliable_gpu_metrics()
 
         # model.transcribe 호출 시 batch_size 인자 명시적 전달
         segments_iterable, info = model.transcribe(audio_path, batch_size=batch_size, **decode_options)
@@ -468,8 +365,8 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
         
         logger.info("✅ STT 처리 완료", extra=final_log_extra)
         
-        # GPU 모니터링 강화 (처리 완료 시)
-        update_accurate_gpu_metrics()
+        # GPU 모니터링 (처리 완료 시)
+        update_reliable_gpu_metrics()
         
         return segments_list, info
 
@@ -558,26 +455,22 @@ async def upload_audio(
 @app.get("/")
 async def read_root():
     """Root health check"""
-    return {"message": "🚀 Whisper STT API Server with Accurate GPU Monitoring is running"}
+    return {"message": "🚀 Whisper STT API Server with Reliable GPU Monitoring is running"}
 
 @app.get("/gpu-status")
 async def get_gpu_status():
-    """개선된 GPU 상태 확인 엔드포인트"""
-    gpu_info = get_accurate_gpu_info()
+    """신뢰할 수 있는 GPU 상태 확인 엔드포인트"""
+    gpu_info = get_reliable_gpu_info()
     if gpu_info:
         return {
             "status": "available",
-            "total_utilization_percent": gpu_info['total_utilization'],
-            "total_memory_used_mb": gpu_info['total_memory_mb'],
-            "total_memory_capacity_mb": gpu_info['total_memory_capacity_mb'],
-            "temperature_celsius": gpu_info['temperature_c'],
-            "power_draw_watts": gpu_info['power_draw_w'],
-            "whisper_processes": gpu_info['whisper_processes'],
-            "whisper_memory_mb": gpu_info['whisper_memory_mb'],
-            "whisper_utilization_percent": gpu_info['estimated_whisper_utilization'],
-            "whisper_process_count": gpu_info['whisper_process_count'],
-            "container_id": gpu_info['container_id'],
-            "memory_usage_ratio": round(gpu_info['total_memory_mb'] / gpu_info['total_memory_capacity_mb'] * 100, 1)
+            "utilization_percent": gpu_info['utilization_percent'],
+            "memory_used_mb": gpu_info['memory_used_mb'],
+            "memory_total_mb": gpu_info['memory_total_mb'],
+            "memory_usage_ratio_percent": round(gpu_info['memory_used_mb'] / gpu_info['memory_total_mb'] * 100, 1),
+            "temperature_celsius": gpu_info['temperature_celsius'],
+            "power_draw_watts": gpu_info['power_draw_watts'],
+            "note": "This shows total GPU status. Process-level breakdown not available in WSL2 environment."
         }
     else:
         return {"status": "unavailable", "error": "Unable to query GPU information"}
