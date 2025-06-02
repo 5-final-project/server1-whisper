@@ -383,11 +383,9 @@ def process_audio(audio_path: str, request_id: str, batch_size: int = BATCH_SIZE
 async def upload_audio(
     request: Request, 
     file: UploadFile = File(...), 
-    meeting_info: str = Form("N/A"), 
     language: Optional[str] = Form(None), 
     title: str = Form(...), 
-    meeting_attendees: List[str] = Form([]), 
-    writer: str = Form(...)
+    meeting_attendees: Optional[str] = Form(None), 
 ):
     """
     오디오 파일을 STT로 변환하여 전체 텍스트를 JSON으로 반환합니다.
@@ -398,11 +396,11 @@ async def upload_audio(
 
     # Construct initial_prompt from form parameters
     if language == "en":
-        prompt_attendees_en = ", ".join(meeting_attendees) if meeting_attendees else "No attendee information"
-        initial_prompt_text = f"This recording is about the following meeting:\nMeeting Title: {title}\nAttendees: {prompt_attendees_en}\nRecorder: {writer}\n"
+        prompt_attendees_en = meeting_attendees if meeting_attendees else "No attendee information"
+        initial_prompt_text = f"This recording is about the following meeting:\nMeeting Title: {title}\nAttendees: {prompt_attendees_en}\n"
     else:  # Default to Korean for 'ko' or if language is not specified (None) or other values
-        prompt_attendees_ko = ", ".join(meeting_attendees) if meeting_attendees else "참석자 정보 없음"
-        initial_prompt_text = f"이 녹음은 다음 회의에 관한 것입니다:\n회의 제목: {title}\n참석자: {prompt_attendees_ko}\n작성자: {writer}\n"
+        prompt_attendees_ko = meeting_attendees if meeting_attendees else "참석자 정보 없음"
+        initial_prompt_text = f"이 녹음은 다음 회의에 관한 것입니다:\n회의 제목: {title}\n참석자: {prompt_attendees_ko}\n"
     
     base_log_extra_upload = {"request_id": request_id, "service.name": "whisper-stt", "api.endpoint": "/upload-audio"}
     logger.info(
@@ -411,7 +409,6 @@ async def upload_audio(
             **base_log_extra_upload,
             "meeting.title": title,
             "meeting.attendees_count": len(meeting_attendees) if meeting_attendees else 0,
-            "meeting.writer": writer,
             "initial_prompt.length": len(initial_prompt_text),
             "initial_prompt.language_used": "en" if language == "en" else "ko"
         }
@@ -445,7 +442,7 @@ async def upload_audio(
         
         return {
             "text": full_text,
-            "meeting_info": meeting_info,
+            "title": title,
             "processing_time_sec": round(time.time() - start_time, 2)
         }
     finally:
