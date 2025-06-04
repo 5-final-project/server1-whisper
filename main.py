@@ -219,7 +219,7 @@ app.add_middleware(
 )
 
 # --- 설정 ---
-MODEL_SIZE = "distil-large-v3"
+MODEL_SIZE = "medium"
 if torch.cuda.is_available():
     DEVICE = "cuda"
     COMPUTE_TYPE = "float16"
